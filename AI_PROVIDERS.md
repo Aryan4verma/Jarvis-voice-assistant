@@ -47,28 +47,28 @@ the normalized interface.
 | `shared/providers/anthropic.mjs` | Claude-specific stop/error/usage and image translation. Not part of the generic message contract. |
 
 The bridge adapter also exposes `start()` to the host, returning a result promise
-and idempotent `cancel()` receipt. Its optional per-operation runtime services
-currently contain SDK MCP servers built by the host. Those service factories
-(`bridge/panels.mjs`, `ui.mjs`, `vision.mjs`, `chrome.mjs`) intentionally remain
-SDK-specific; this phase does not replace the tool or browser architecture.
-Settings isolation (`settingSources: []`), the existing permission gate, persona,
-24-turn limit and partial streaming remain intact. The permission callback is a
-last gate, not a complete tool sandbox.
+and idempotent `cancel()` receipt. Its per-operation runtime contains SDK MCP
+servers for Claude Agent or validated function handlers for OpenRouter. Existing
+display, interface and vision handlers are reused through `bridge/functions.mjs`;
+the browser transport and external MCP architecture are preserved. Claude's
+settings isolation (`settingSources: []`), permission gate, persona, 24-turn limit
+and partial streaming remain intact. The permission callback is a last gate,
+not a complete tool sandbox.
 
 ## Chat versus agent capabilities
 
 Capability values are `true`, `false`, or `unknown`. The current adapters support
-text and streaming. Claude Agent SDK supplies an agent runtime; direct Messages
-API does not. Vision, model tool support and reasoning controls remain unknown
-for arbitrary configured model IDs: no model catalog is queried and no readiness
-or authentication is implied. Explicitly unsupported vision/text requests are
-rejected. Unknown capability requests may be delegated to the provider and fail
-with a normalized error; unknown is never advertised as supported.
+text and streaming. Claude Agent SDK supplies an agent runtime; OpenRouter chat
+does not. Claude's arbitrary configured model capabilities remain unknown where
+the SDK supplies no metadata. OpenRouter checks its on-demand model catalog:
+vision follows input modalities; tools and reasoning follow supported parameters.
+Unknown vision is rejected for OpenRouter, and unknown tools/reasoning are
+omitted. Model metadata alone does not imply valid credentials or readiness.
 
-A future chat adapter can stream text/images/function-call activity without
-claiming MCP, filesystem execution or agent session support. Full agent behavior
-requires an actual runtime/tool implementation. There is no generic tool loop or
-fake Agent SDK equivalence in this foundation.
+OpenRouter can stream text/images/function activity with a bounded continuation
+loop. Its current functions cover JARVIS display/UI and supported camera capture;
+they do not imply Claude's browser, external MCP, filesystem or agent session
+capabilities. Full agent behavior requires an actual runtime/tool implementation.
 
 ## Configuration and future adapters
 
