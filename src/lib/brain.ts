@@ -1,12 +1,12 @@
-import { BACKEND } from '../config'
+import { AI_SELECTION } from '../config'
 import * as direct from './anthropic'
 import * as bridge from './bridge'
-import type { AskHandlers, Msg } from './anthropic'
+import type { AIAdapter, AIHandlers, AIMessage, AIRequest, AIResult } from './ai'
 import type { Blade, Panel } from '../store'
 import { turns, type Turn, type CancelReason } from './turn'
 export { turns } from './turn'
 
-export type { AskHandlers, Msg }
+export type { AIMessage, AIRequest, AIHandlers, AIEvent, AIResult, AIProviderInfo, AIError, AIUsage } from './ai'
 export type { ConnectionState } from './bridge'
 
 /**
@@ -22,19 +22,26 @@ export type { ConnectionState } from './bridge'
  *            and can only use remote HTTP MCP servers.
  */
 
-export const usingBridge = BACKEND === 'bridge'
+const usingBridge = AI_SELECTION.transport === 'bridge'
+const provider: AIAdapter<Turn> = usingBridge ? bridge.adapter : direct.adapter
+export const providerInfo = () => provider.describe()
+export const configurationIssue = () => provider.configurationIssue?.() ?? null
 
-/** Conversation state lives in the bridge session, so history is only threaded
- *  through on the direct path. */
+/** Shared request entry point, including images; the voice wrapper below uses text. */
+export function generate(request: AIRequest, handlers: AIHandlers, turn: Turn): Promise<AIResult> {
+  return provider.generate(request, {
+    onEvent: event => { if (turn.current()) handlers.onEvent(event) },
+  }, turn)
+}
+
+/** Adapters decide whether to use message history or their own agent session. */
 export async function ask(
   prompt: string,
-  history: Msg[],
-  handlers: AskHandlers,
+  history: AIMessage[],
+  handlers: AIHandlers,
   turn: Turn,
-): Promise<{ text: string; tools: string[] }> {
-  return usingBridge
-    ? bridge.ask(prompt, handlers, turn)
-    : direct.ask([...history, { role: 'user', content: prompt }], handlers, turn)
+): Promise<AIResult> {
+  return generate({ messages: [...history, { role: 'user', content: prompt }] }, handlers, turn)
 }
 
 export async function warm(): Promise<void> {

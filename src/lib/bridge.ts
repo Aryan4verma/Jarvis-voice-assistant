@@ -1,4 +1,6 @@
-import type { AskHandlers } from './anthropic'
+import { AIProviderError, aiError, completionReason, legacyEvents, readUsage, validContent, validRequest,
+  type AIAdapter, type AIHandlers, type AIProviderInfo, type AIRequest, type AIResult,
+  type AIUsage, type AIError, type LegacyAskHandlers } from './ai'
 import type { Blade, Panel } from '../store'
 import { BRIDGE_WS_URL } from '../config'
 import { ensureBridgeSession } from './bridgeSession'
@@ -38,6 +40,12 @@ type Frame = {
   seconds?: number
   when?: string
   servers?: Array<string | { name?: string }>
+  provider?: AIProviderInfo
+  usage?: AIUsage
+  error?: AIError
+  displayName?: string
+  phase?: 'start' | 'activity'
+  historyMode?: 'messages' | 'session'
 }
 
 
@@ -46,6 +54,8 @@ let connecting: Promise<WebSocket> | null = null
 
 /** Server names reported by the bridge, for the HUD readout. */
 let servers: string[] = []
+let providerInfo: AIProviderInfo | null = null
+let historyMode: 'messages' | 'session' = 'messages'
 export const bridgeServers = () => servers
 
 /** The list arrives twice — once from config, once with live status — so the
@@ -173,6 +183,8 @@ function dispatch(ws: WebSocket) {
     try { msg = JSON.parse(e.data as string) } catch { return }
     if (!msg || typeof msg !== 'object') return
     if (msg.scope === 'connection' && msg.type === 'ready') {
+      providerInfo = msg.provider ?? null
+      historyMode = msg.historyMode === 'session' ? 'session' : 'messages'
       servers = (msg.servers ?? []).map((s) => typeof s === 'string' ? s : s.name ?? '').filter(Boolean)
       onServers?.(servers)
       firstReady.resolve()
@@ -283,6 +295,8 @@ function connect(): Promise<WebSocket> {
       settle(new Error('The bridge closed the connection.'))
       if (socket === ws) {
         socket = null
+        providerInfo = null
+        historyMode = 'messages'
         if (pending?.ws === ws) pending.turn.cancel('disconnect')
         turns.cancel('disconnect') // Includes speech still draining after backend completion.
         if (!closing) onConnection?.('lost')
@@ -333,11 +347,15 @@ type Pending = {
 }
 let pending: Pending | null = null
 
-export function ask(prompt: string, handlers: AskHandlers, turn: Turn): Promise<{ text: string; tools: string[] }> {
+export function generate(request: AIRequest, handlers: AIHandlers, turn: Turn): Promise<AIResult> {
+  const last = request.messages.at(-1)
+  if (last?.role !== 'user' || !validContent(last.content)) return Promise.reject(new AIProviderError(aiError('invalid-request')))
+  const content = last.content
   if (pending && pending.turn !== turn) pending.turn.cancel('replaced')
   return new Promise((resolve, reject) => {
     let text = '', done = false, timer: ReturnType<typeof setTimeout> | null = null
     const tools: string[] = []
+    let usage: AIUsage | undefined
     const cleanup = () => {
       done = true
       if (pending === owner) pending = null
@@ -366,16 +384,28 @@ export function ask(prompt: string, handlers: AskHandlers, turn: Turn): Promise<
       },
       frame(msg) {
         if (done) return
-        if (msg.type === 'text') { text += msg.delta ?? ''; handlers.onText(msg.delta ?? '') }
+        if (msg.type === 'text') { text += msg.delta ?? ''; handlers.onEvent({ type: 'text', delta: msg.delta ?? '' }) }
         else if (msg.type === 'tool' && msg.name) {
           if (tools.length < 256) tools.push(msg.name)
-          handlers.onTool(prettyToolName(msg.name))
+          handlers.onEvent({ type: 'tool', name: msg.name, id: msg.id, displayName: msg.displayName, phase: msg.phase })
+        } else if (msg.type === 'usage') {
+          usage = readUsage(msg.usage)
+          if (usage) handlers.onEvent({ type: 'usage', usage })
         } else if (msg.type === 'done') {
           // SDK builds without deltas still need an audible answer.
-          if (!text && msg.text) { text = msg.text; handlers.onText(text) }
-          cleanup(); resolve({ text: text.trim(), tools })
-        } else if (msg.type === 'error') owner.fail(new Error(msg.message ?? 'The bridge reported an error.'))
-        else if (msg.type === 'cancelled') turn.cancel('stop')
+          if (!text && msg.text) { text = msg.text; handlers.onEvent({ type: 'text', delta: text }) }
+          usage = readUsage(msg.usage) ?? usage
+          const reason = completionReason(msg.reason)
+          handlers.onEvent({ type: 'done', text: text.trim(), reason, ...(usage ? { usage } : {}) })
+          cleanup(); resolve({ text: text.trim(), tools, reason, ...(usage ? { usage } : {}) })
+        } else if (msg.type === 'error') {
+          const error = msg.error ? aiError(msg.error.category, msg.error.diagnostics, msg.error.message) : aiError('unknown')
+          handlers.onEvent({ type: 'error', error })
+          owner.fail(new AIProviderError(error))
+        } else if (msg.type === 'cancelled') {
+          handlers.onEvent({ type: 'cancelled', reason: 'cancelled' })
+          turn.cancel('stop')
+        }
       },
     }
     pending = owner
@@ -385,10 +415,21 @@ export function ask(prompt: string, handlers: AskHandlers, turn: Turn): Promise<
     void connect().then((ws) => {
       if (done || pending !== owner || !turn.current()) return
       owner.ws = ws
-      try { ws.send(JSON.stringify({ type: 'ask', turnId: turn.turnId, text: prompt })) }
+      if (historyMode === 'messages' && !validRequest(request)) { owner.fail(new AIProviderError(aiError('invalid-request'))); return }
+      const payload = historyMode === 'session'
+        ? (typeof content === 'string' ? { text: content } : { content })
+        : { messages: request.messages }
+      try { ws.send(JSON.stringify({ type: 'ask', turnId: turn.turnId, ...payload })) }
       catch { turn.cancel('disconnect') }
     }, () => { if (!done) turn.cancel('disconnect') })
   })
+}
+
+export const adapter: AIAdapter<Turn> = { get historyMode() { return historyMode }, describe: () => providerInfo, generate }
+
+/** Compatibility for callers using the original transport callbacks. */
+export function ask(prompt: string, handlers: LegacyAskHandlers, turn: Turn): Promise<AIResult> {
+  return generate({ messages: [{ role: 'user', content: prompt }] }, legacyEvents(handlers), turn)
 }
 
 /** No request replay on reconnect. A dead connection loses its owned turn. */
@@ -402,11 +443,6 @@ export function shutdown(): void {
   socket = null
   connecting = null
   servers = []
-}
-
-/** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */
-function prettyToolName(raw: string): string {
-  if (!raw.startsWith('mcp__')) return raw
-  const [, server, ...rest] = raw.split('__')
-  return `${server} · ${rest.join(' ').replace(/_/g, ' ')}`
+  providerInfo = null
+  historyMode = 'messages'
 }

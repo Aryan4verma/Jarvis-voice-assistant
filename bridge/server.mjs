@@ -17,7 +17,8 @@
 
 import { WebSocketServer } from 'ws'
 import { once } from 'node:events'
-import { query } from '@anthropic-ai/claude-agent-sdk'
+import { bridgeProviderFactory } from './providers/index.mjs'
+import { aiError, validRequest } from '../shared/ai.mjs'
 import { displayServer } from './panels.mjs'
 import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
@@ -137,6 +138,10 @@ const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
  * dead air shows.
  */
 const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
+const createProvider = bridgeProviderFactory({
+  providerId: process.env.JARVIS_AI_PROVIDER?.trim() || 'claude-agent',
+  modelId: MODEL, reasoningEffort: EFFORT,
+})
 
 /**
  * Both spellings of every renamed built-in are listed on purpose. The SDK
@@ -1069,18 +1074,6 @@ console.log(
     (ALLOW_NO_ORIGIN ? ' and clients that send no origin' : ''),
 )
 
-/**
- * What to tell the browser when a turn ends badly. Plain sentences, because
- * whatever reaches the client is liable to be spoken.
- */
-const RESULT_FAILURES = {
-  error_during_execution: 'The turn failed part way through.',
-  error_max_turns: 'The turn ran too long and was stopped.',
-  error_max_budget_usd: 'The budget for this turn ran out.',
-  error_max_structured_output_retries: 'The answer could not be assembled.',
-  default: 'The turn ended without an answer.',
-}
-
 // One immutable query scope per interaction. Resume preserves conversation
 // context without reusing callbacks that could relabel a cancelled turn.
 const connections = new Set()
@@ -1088,20 +1081,24 @@ wss.on('connection', (socket) => {
   socket.on('error', (err) => console.warn('[jarvis] websocket failed:', errorLabel(err)))
   console.log('[jarvis] client connected')
   const send = (message) => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message)) }
-  send({ scope: 'connection', type: 'ready', servers: Object.keys(MCP_SERVERS) })
-  let active = null, resumeId = null, closed = false
+  const provider = createProvider({
+    systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
+    cwd: homedir(), decideTool, debug: process.env.JARVIS_DEBUG === '1',
+    onReady(servers) {
+      send({ scope: 'connection', type: 'ready', servers, provider: provider.describe(), historyMode: provider.historyMode })
+      mcpState = 'loaded; status supplied by agent'
+      console.log(`[jarvis] ${servers.length} MCP servers available`)
+    },
+  })
+  send({ scope: 'connection', type: 'ready', servers: Object.keys(MCP_SERVERS), provider: provider.describe(), historyMode: provider.historyMode })
+  let active = null, closed = false
   const recentIds = new Set()
   const messageAllowed = createRateLimit(240), askAllowed = createRateLimit(20)
   const cancel = (turn, reason) => {
     if (!turn || !turn.scope.live()) return
     // Quarantine first, before invoking SDK hooks that may emit final events.
     turn.scope.stop()
-    turn.controller.abort()
-    let backend = 'not-started'
-    if (turn.session) {
-      try { turn.session.close(); backend = 'termination-requested' }
-      catch { backend = 'termination-unconfirmed' }
-    }
+    const backend = turn.operation?.cancel() ?? 'not-started'
     send({ scope: 'turn', type: 'cancelled', turnId: turn.scope.turnId, reason, backend })
     if (active === turn) active = null
   }
@@ -1115,244 +1112,37 @@ wss.on('connection', (socket) => {
   connections.add(disconnect)
   socket.on('close', disconnect)
 
-  async function run(turn, text) {
+  async function run(turn, request) {
     const scope = turn.scope
-    const resume = resumeId
-    const seenTools = new Set(), heldTools = new Map()
-    let terminal = false
-    scope.signal.addEventListener('abort', () => { seenTools.clear(); heldTools.clear() }, { once: true })
-    const announceTool = (id, name) => {
-      if (!name || (id && seenTools.has(id))) return
-      if (!scope.live()) return
-      if (id && seenTools.size < 256) seenTools.add(id)
-      // The display tool isn't work being done, it's the HUD drawing itself —
-      // announcing it would put "jarvis · display" in the tool badge and trigger
-      // a "working on it" filler for something already on screen.
-      if (name === 'mcp__jarvis__display') return
-      // The ui_* tools are the same case one step further: retinting the
-      // interface is the interface talking about itself, not work being done for
-      // the user, and the badge would be describing the very thing they can see.
-      if (name.startsWith('mcp__jarvis_ui__')) return
-      if (decideTool(name)) return scope.send({ type: 'tool', name })
-      if (id && heldTools.size < 256) heldTools.set(id, name)
-    }
-
-    const settleTool = (id, failed) => {
-      const name = heldTools.get(id)
-      if (name === undefined) return
-      heldTools.delete(id)
-      if (!failed) scope.send({ type: 'tool', name })
-    }
-
-
     try {
       if (!scope.live() || closed) return
-      async function* messages() {
-        yield { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, ...(resume ? { session_id: resume } : {}) }
+      // Tool callbacks still close over this immutable scope, never active.
+      const mcpServers = {
+        ...MCP_SERVERS,
+        jarvis: displayServer(
+          (panel) => scope.send({ type: 'panel', panel }),
+          (blade) => scope.send({ type: 'blade', blade }),
+        ),
+        jarvis_ui: uiServer((op, args) => scope.send({ type: 'ui', op, args })),
+        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES, signal: scope.signal }),
+        jarvis_eyes: visionServer(scope.request),
       }
-      const session = query({
-        prompt: messages(),
-        options: {
-          abortController: turn.controller,
-          ...(resume ? { resume } : {}),
-          // Everything Claude Code has configured, plus the HUD as an in-process
-          // server. The HUD's handler closes over this socket, so a `display` call
-          // lands on screen directly — which is also why this object is built per
-          // turn rather than once.
-          mcpServers: {
-            ...MCP_SERVERS,
-            jarvis: displayServer(
-              (panel) => scope.send({ type: 'panel', panel }),
-              (blade) => scope.send({ type: 'blade', blade }),
-            ),
-            // The interface controls, on the same socket. A separate key because
-            // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
-            // one server; the underscore in it is why decideTool and announceTool
-            // both name `jarvis_ui` explicitly.
-            jarvis_ui: uiServer((op, args) => scope.send({ type: 'ui', op, args })),
-            // The user's own Chrome, over the extension's native-host socket. It
-            // holds no per-connection state, but it is built here with the rest so
-            // the write gate is read once, at the same point as everything else.
-            jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES, signal: scope.signal }),
-            // The camera, which unlike everything else here has to ask and wait.
-            jarvis_eyes: visionServer(scope.request),
-          },
-          // A plain system prompt, not the claude_code preset. The preset is
-          // tuned for a coding agent — verbose, file-oriented, and a large chunk
-          // of input tokens on every turn. Replacing it makes the persona stick,
-          // keeps answers short enough to speak, and cuts cost per turn.
-          systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
-          // Run from the home directory so project-scoped MCP servers don't shadow
-          // the global ones, and so file tools have a sane root.
-          cwd: homedir(),
-          // No filesystem settings at all. Left to its default the SDK loads
-          // ~/.claude/settings.json and settings.local.json exactly as the CLI
-          // does — which on a working machine means a bypassPermissions default
-          // and a pile of allow-rules for Bash. Allow-rules are matched before the
-          // permission callback, so decideTool below would never even be asked
-          // about the tools it most needs to refuse. The callback remains a
-          // last gate, not a complete tool sandbox. It also stops the global
-          // CLAUDE.md riding along on
-          // every voice turn, carrying instructions written for a coding agent
-          // into a conversation that is meant to be two sentences long.
-          //
-          // The cost is that MCP servers stop being discovered too, which is why
-          // mcpServers above passes them in by hand.
-          settingSources: [],
-          // Stated explicitly, and it has to be.
-          //
-          // With no `model` here the SDK falls back to its own default, which on
-          // this machine resolved to claude-opus-4-8[1m] — not what src/config.ts
-          // declares for the browser-direct path, and not anything anyone chose.
-          // Normally your own `/model` preference would decide, but that lives in
-          // the settings files `settingSources: []` deliberately stops loading, so
-          // without this line nothing in the project has a say at all.
-          model: MODEL,
-          effort: EFFORT,
-          maxTurns: 24,
-          permissionMode: 'default',
-          // Without this the SDK only emits whole assistant messages, and JARVIS
-          // would sit silent until the entire answer was written. Partial events
-          // are what let speech start on the first finished sentence.
-          includePartialMessages: true,
-          // Signature is (toolName, input, options) and it must return a
-          // PermissionResult object. Returning a bare boolean silently denies
-          // everything, with the tool name arriving undefined.
-          //
-          // Worth knowing: this is a last gate, not the only one. Calls the CLI
-          // has already settled never arrive here — its own classifier waves
-          // through a `Bash: echo hello` without asking, and only reaches us for
-          // something with a consequence, like a `touch`. So a deny here is
-          // reliable; an absence of a call here is not proof nothing ran.
-          canUseTool: async (toolName) => {
-            const ok = scope.live() && decideTool(toolName)
-            console.log(`[jarvis] tool decision: ${ok ? 'allow' : 'deny'}`)
-            return ok
-              ? { behavior: 'allow' }
-              : {
-                  behavior: 'deny',
-                  // Every word of this can end up spoken, so it carries no command
-                  // to read out — the persona is forbidden from saying one aloud.
-                  message:
-                    'Blocked: JARVIS is running in read-only mode and cannot take' +
-                    ' actions that change anything. Tell the user this action is' +
-                    ' unavailable until they enable write access on the machine.',
-                }
-          },
-        },
-      })
-
-      turn.session = session
-      for await (const msg of session) {
-        if (!scope.live() || closed) continue
-        if (process.env.JARVIS_DEBUG === '1') console.log('[msg]', msg.type, msg.event?.type ?? '')
-        switch (msg.type) {
-          // Raw Anthropic stream events, surfaced by includePartialMessages.
-          // This is the ONLY place spoken text arrives: there is no top-level
-          // text_delta message in the SDK union and the 'assistant' message
-          // carries no deltas either. Turn includePartialMessages off and
-          // JARVIS goes completely mute.
-          case 'stream_event': {
-            const ev = msg.event
-            if (
-              ev?.type === 'content_block_delta' &&
-              ev.delta?.type === 'text_delta' &&
-              ev.delta.text
-            ) {
-              scope.send({ type: 'text', delta: ev.delta.text })
-            }
-            if (
-              ev?.type === 'content_block_start' &&
-              ev.content_block?.type === 'tool_use'
-            ) {
-              announceTool(ev.content_block.id, ev.content_block.name)
-            }
-            break
-          }
-
-          case 'assistant': {
-            // Fallback for builds that emit whole assistant messages rather
-            // than partial events. Deduped against the stream_event path.
-            for (const block of msg.content ?? msg.message?.content ?? []) {
-              if (block.type === 'tool_use') {
-                announceTool(block.id, block.name)
-              }
-            }
-            break
-          }
-
-          case 'user': {
-            // Tool results come back as a user message. This is the only place
-            // a held announcement can be resolved: a refused tool arrives with
-            // is_error set and stays off the HUD, anything else ran.
-            const blocks = msg.message?.content
-            if (!Array.isArray(blocks)) break
-            for (const block of blocks) {
-              if (block?.type === 'tool_result') {
-                settleTool(block.tool_use_id, block.is_error === true)
-              }
-            }
-            break
-          }
-
-          case 'result':
-            // A result is not automatically a success. The error subtypes
-            // carry no `result` field at all, so reporting them as 'done' with
-            // empty text is indistinguishable from a turn that simply had
-            // nothing to say — the HUD stops spinning and JARVIS stands there
-            // silent. Say what happened instead.
-            if (msg.subtype === 'success') {
-              scope.send({
-                type: 'done',
-                text: msg.result ?? '',
-                costUsd: msg.total_cost_usd ?? null,
-              })
-            } else {
-              console.error(
-                `[jarvis] turn failed: ${Object.hasOwn(RESULT_FAILURES, msg.subtype) ? msg.subtype : 'unknown result'}`,
-              )
-              scope.send({
-                type: 'error',
-                message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
-              })
-            }
-            // Whatever was waiting on this turn to finish can go now. This is
-            // the only place a turn is genuinely over.
-            if (msg.subtype === 'success' && typeof msg.session_id === 'string') resumeId = msg.session_id
-            terminal = true
-            scope.stop()
-            seenTools.clear()
-            heldTools.clear()
-            break
-
-          case 'system':
-            if (msg.subtype === 'init') {
-              // Servers report 'pending' until first use — they connect
-              // lazily — so only drop the ones that are actually unusable.
-              const usable = (msg.mcp_servers ?? [])
-                .filter((s) => s.status !== 'needs-auth' && s.status !== 'failed')
-                .map((s) => s.name)
-              send({ scope: 'connection', type: 'ready', servers: usable })
-              mcpState = 'loaded; status supplied by agent'
-              console.log(`[jarvis] ${usable.length} MCP servers available`)
-            }
-            break
-        }
-        if (terminal) break
-      }
-      if (scope.live() && !terminal && !closed) scope.send({ type: 'error', message: 'The agent stream ended without a result.' })
+      turn.operation = provider.start(request, {
+        onEvent: event => scope.send(event),
+      }, { turnId: scope.turnId, signal: scope.signal, current: scope.live }, { mcpServers })
+      await turn.operation.result
     } catch (err) {
       if (scope.live() && !closed) {
         console.error('[jarvis] session error:', errorLabel(err))
-        scope.send({ type: 'error', message: 'The agent session failed. Check Claude authentication and local configuration.' })
+        // Adapter errors already crossed the normalized boundary. Startup/tool
+        // construction failures get a safe host error instead of raw diagnostics.
+        if (!turn.operation) scope.send({ type: 'error', error: aiError('unknown') })
         scope.stop()
         socket.close()
       }
     } finally {
       scope.stop()
-      try { turn.session?.close() } catch { /* output remains quarantined */ }
-      seenTools.clear()
-      heldTools.clear()
+      turn.operation?.cancel()
       if (active === turn) active = null
     }
   }
@@ -1365,15 +1155,18 @@ wss.on('connection', (socket) => {
     if (msg.type === 'ask') {
       const id = msg.turnId
       if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) return
-      if (typeof msg.text !== 'string' || !msg.text.trim() || Buffer.byteLength(msg.text) > 32768 || !askAllowed() || recentIds.has(id)) {
-        return send({ scope: 'turn', type: 'error', turnId: id, message: 'Request limit reached or turn ID reused. Retry with a new interaction.' })
+      // The transport accepts neutral history; session adapters use only its last message.
+      const request = { messages: msg.messages ?? [{ role: 'user', content: msg.content ?? msg.text }] }
+      if (!validRequest(request) || !askAllowed() || recentIds.has(id)) {
+        return send({ scope: 'turn', type: 'error', turnId: id,
+          error: aiError('invalid-request', {}, 'Request limit reached or turn ID reused. Retry with a new interaction.') })
       }
       cancel(active, 'replaced')
       recentIds.add(id)
       if (recentIds.size > 64) recentIds.delete(recentIds.values().next().value)
-      const turn = { scope: createTurnScope(id, send), controller: new AbortController(), session: null }
+      const turn = { scope: createTurnScope(id, send), operation: null }
       active = turn
-      void run(turn, msg.text)
+      void run(turn, request)
     } else if (msg.type === 'reply') active?.scope.reply(msg)
     else if (msg.type === 'cancel' && msg.turnId === active?.scope.turnId) cancel(active, 'frontend')
   })

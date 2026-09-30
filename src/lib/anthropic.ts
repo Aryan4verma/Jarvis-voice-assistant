@@ -1,5 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { abortable, type Turn } from './turn'
+import { AIProviderError, aiError, assertCapabilities, legacyEvents, sumUsage, validContent,
+  type AIAdapter, type AIHandlers, type AIInteraction, type AIMessage, type AIRequest, type AIResult, type AIUsage, type LegacyAskHandlers } from './ai'
+import { anthropicContent, anthropicError, anthropicStopReason, anthropicUsage, claudeInfo } from '../../shared/providers/anthropic.mjs'
 import { env, MODEL, FAST_MODE, SYSTEM_PROMPT, activeServers } from '../config'
 
 /**
@@ -13,14 +16,8 @@ const client = new Anthropic({
   dangerouslyAllowBrowser: true,
 })
 
-export type Msg = Anthropic.Beta.BetaMessageParam
-
-export type AskHandlers = {
-  /** Fires for each chunk of the spoken answer. */
-  onText: (delta: string) => void
-  /** Fires when Claude starts running a remote tool. */
-  onTool: (name: string) => void
-}
+type ProviderMessage = Anthropic.Beta.BetaMessageParam
+const info = claudeInfo('anthropic-api', MODEL, 'chat')
 
 /**
  * A server-side tool loop that runs long enough gets paused rather than
@@ -40,14 +37,16 @@ const MAX_CONTINUATIONS = 3
  * The browser never touches them, so there's no CORS, no OAuth plumbing here,
  * and no bridge process to keep alive.
  */
-export async function ask(
-  history: Msg[],
-  handlers: AskHandlers,
-  owner: Turn,
-): Promise<{ text: string; tools: string[] }> {
+export async function generate(request: AIRequest, handlers: AIHandlers, owner: AIInteraction): Promise<AIResult> {
   const servers = activeServers()
   const usedTools: string[] = []
   let text = ''
+  let finished = false
+  const samples: AIUsage[] = []
+  const current = () => !finished && !owner.signal.aborted && owner.current()
+  const emit = (event: Parameters<AIHandlers['onEvent']>[0]) => { if (current()) handlers.onEvent(event) }
+  const cancelled = (): AIResult => ({ text: text.trim(), tools: usedTools, reason: 'cancelled', ...usageResult() })
+  const usageResult = () => { const usage = sumUsage(samples); return usage ? { usage } : {} }
   let active: ReturnType<typeof client.beta.messages.stream> | null = null
   const abort = () => active?.abort()
   owner.signal.addEventListener('abort', abort, { once: true })
@@ -83,25 +82,30 @@ export async function ask(
     ],
   }
 
-  let messages: Msg[] = history
+  let messages: ProviderMessage[] = []
 
   try {
+    assertCapabilities(info, request)
+    if (request.messages.some(message => !validContent(message.content))) throw new AIProviderError(aiError('invalid-request', { providerId: info.providerId }))
+    messages = request.messages.map(message => ({ role: message.role, content: anthropicContent(message.content) } as ProviderMessage))
     for (let turn = 0; ; turn++) {
       // A barge-in between continuations has no stream to abort, so the loop
       // has to check for itself rather than opening another one.
-      if (!owner.current()) return { text: text.trim(), tools: usedTools }
+      if (!current()) return cancelled()
+      const before = text.length
 
       const stream = client.beta.messages.stream({ ...params, messages }, { signal: owner.signal, maxRetries: 0 })
       active = stream
+      if (!current()) { stream.abort(); active = null; return cancelled() }
 
       stream.on('text', (delta) => {
-        if (!owner.current()) return
+        if (!current()) return
         text += delta
-        handlers.onText(delta)
+        emit({ type: 'text', delta })
       })
 
       stream.on('streamEvent', (event) => {
-        if (!owner.current()) return
+        if (!current()) return
         if (event.type !== 'content_block_start') return
         const block = event.content_block
 
@@ -112,10 +116,10 @@ export async function ask(
         // spinner and no filler line. Just several seconds of silence.
         if (block.type === 'mcp_tool_use') {
           if (usedTools.length < 256) usedTools.push(block.name)
-          handlers.onTool(block.name)
+          emit({ type: 'tool', name: block.name, id: block.id, phase: 'start' })
         } else if (block.type === 'server_tool_use') {
           if (usedTools.length < 256) usedTools.push(block.name)
-          handlers.onTool(block.name.replace(/_/g, ' '))
+          emit({ type: 'tool', name: block.name, displayName: block.name.replace(/_/g, ' '), id: block.id, phase: 'start' })
         }
       })
 
@@ -126,45 +130,73 @@ export async function ask(
         // A barge-in aborts this stream on purpose. That surfaces as a
         // rejection, and it isn't an error the user should see a toast for —
         // hand back what he'd already said.
-        if (!owner.current()) return { text: text.trim(), tools: usedTools }
+        if (!current()) return cancelled()
         throw err
       } finally {
         active = null
       }
 
-      if (!owner.current()) return { text: text.trim(), tools: usedTools }
+      if (!current()) return cancelled()
+      // A whole-message-only SDK response still produces the same text event.
+      if (text.length === before) {
+        const fallback = (final.content ?? []).filter(block => block.type === 'text').map(block => block.text).join('')
+        if (fallback) { text += fallback; emit({ type: 'text', delta: fallback }) }
+      }
+      samples.push(anthropicUsage(final.usage) ?? {})
+      const usage = sumUsage(samples)
+      if (usage) emit({ type: 'usage', usage })
 
       if (final.stop_reason === 'pause_turn' && turn < MAX_CONTINUATIONS) {
         messages = [...messages, { role: 'assistant', content: final.content }]
         continue
       }
 
-      // Everything below has to go through onText as well as the return value.
+      // Everything below has to emit text events as well as return text.
       // App speaks the deltas; the returned text only feeds history, so a line
       // that is merely returned is a line nobody ever hears.
       if (final.stop_reason === 'refusal') {
         const line = "I can't help with that one, sir."
-        handlers.onText(line)
-        return { text: line, tools: usedTools }
+        emit({ type: 'text', delta: line })
+        emit({ type: 'done', text: line, reason: 'refused', ...usageResult() })
+        return { text: line, tools: usedTools, reason: 'refused', ...usageResult() }
       }
 
       if (final.stop_reason === 'max_tokens') {
         const line = ' There is more, if you want it.'
-        handlers.onText(line)
+        emit({ type: 'text', delta: line })
         text += line
       } else if (final.stop_reason === 'pause_turn') {
         const line = ' That is taking longer than it should, sir. Ask me again.'
-        handlers.onText(line)
+        emit({ type: 'text', delta: line })
         text += line
       }
 
-      return { text: text.trim(), tools: usedTools }
+      const answer: AIResult = { text: text.trim(), tools: usedTools, reason: anthropicStopReason(final.stop_reason), ...usageResult() }
+      emit({ type: 'done', text: answer.text, reason: answer.reason, ...usageResult() })
+      return answer
     }
+  } catch (error) {
+    if (!current()) return cancelled()
+    const normalized = error instanceof AIProviderError ? error.toJSON() : anthropicError(error, info.providerId)
+    emit({ type: 'error', error: normalized })
+    throw new AIProviderError(normalized)
   } finally {
+    finished = true
     active?.abort()
     active = null
     owner.signal.removeEventListener('abort', abort)
   }
+}
+
+export const adapter: AIAdapter = {
+  historyMode: 'messages', describe: () => info, generate,
+  configurationIssue: () => env.anthropicKey ? null : aiError('authentication', { providerId: info.providerId },
+    'No Anthropic API key — copy .env.example to .env.local and set VITE_ANTHROPIC_API_KEY.'),
+}
+
+/** Keep existing low-level callers working without exporting SDK message types. */
+export function ask(history: AIMessage[], handlers: LegacyAskHandlers, owner: Turn): Promise<AIResult> {
+  return generate({ messages: history }, legacyEvents(handlers), owner)
 }
 
 /**

@@ -28,12 +28,11 @@ import {
   watchUi,
   watchConnection,
   connectedLabels,
-  usingBridge,
-  type Msg,
+  configurationIssue,
+  type AIMessage,
 } from './lib/brain'
 import { startAnalyser, micLevel } from './lib/audio'
 import { probeCapabilities } from './lib/capabilities'
-import { env } from './config'
 import { delay, TurnCancelled, type Turn } from './lib/turn'
 
 /**
@@ -69,7 +68,7 @@ const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-
 export default function App() {
   const store = useStore
   const phase = useStore((s) => s.phase)
-  const history = useRef<Msg[]>([])
+  const history = useRef<AIMessage[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<Voice | null>(null)
 
@@ -164,51 +163,48 @@ export default function App() {
 
     try {
       const { text } = await ask(said, history.current, {
-        onText: (delta) => {
+        onEvent: (event) => {
           if (stale()) return
-          if (!started) {
-            started = true
-            store.getState().setPhase('speaking')
-            // The answer arriving is what ends the tool phase — a timer would
-            // clear the readout while a slow tool was still running.
-            store.getState().setActiveTool(null)
-            music.working(false)
-            store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
-          }
-          store.getState().appendToLastTurn(delta)
-          spk.push(delta)
-        },
-        onTool: (name) => {
-          if (stale()) return
-          // Only claim the tooling phase while he has nothing to say yet.
-          // Setting it unconditionally pinned the machine in 'tooling' for the
-          // rest of any answer that called a tool after it started talking,
-          // which also broke the reactor's lip-sync for the remainder.
-          if (!started) store.getState().setPhase('tooling')
-          store.getState().setActiveTool(name)
-          sfx.play('tool')
-          music.working(true)
-          // Say something the moment work starts — a tool can take ten seconds
-          // and silence that long reads as a crash. Once per turn only; a
-          // chain of five tools shouldn't produce five apologies.
-          if (!filled && !started) {
-            filled = true
-            spk.say(forTool(name))
+          if (event.type === 'text') {
+            const delta = event.delta
+            if (!started) {
+              started = true
+              store.getState().setPhase('speaking')
+              // The answer arriving is what ends the tool phase — a timer would
+              // clear the readout while a slow tool was still running.
+              store.getState().setActiveTool(null)
+              music.working(false)
+              store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
+            }
+            store.getState().appendToLastTurn(delta)
+            spk.push(delta)
+          } else if (event.type === 'tool') {
+            const name = event.displayName ?? event.name
+            // Only claim the tooling phase while he has nothing to say yet.
+            // Setting it unconditionally pinned the machine in 'tooling' for the
+            // rest of any answer that called a tool after it started talking,
+            // which also broke the reactor's lip-sync for the remainder.
+            if (!started) store.getState().setPhase('tooling')
+            store.getState().setActiveTool(name)
+            sfx.play('tool')
+            music.working(true)
+            // Say something the moment work starts — a tool can take ten seconds
+            // and silence that long reads as a crash. Once per turn only; a
+            // chain of five tools shouldn't produce five apologies.
+            if (!filled && !started) {
+              filled = true
+              spk.say(forTool(name))
+            }
           }
         },
       }, mine)
 
       if (stale()) return
 
-      // The bridge keeps conversation state in its own session, so history is
-      // only threaded through on the direct path.
-      if (!usingBridge) {
-        history.current.push({ role: 'user', content: said })
-        history.current.push({ role: 'assistant', content: text || '…' })
-        if (history.current.length > 16) {
-          history.current = history.current.slice(-16)
-        }
-      }
+      // Bounded application messages; session adapters ignore this history.
+      history.current.push({ role: 'user', content: said })
+      history.current.push({ role: 'assistant', content: text || '…' })
+      if (history.current.length > 16) history.current = history.current.slice(-16)
 
       await spk.end()
       if (stale()) return
@@ -489,11 +485,8 @@ export default function App() {
     })
     const warming = warm().catch((err: Error) => { if (!signal.aborted) s.setError(err.message) })
 
-    if (!usingBridge && !env.anthropicKey) {
-      s.setError(
-        'No Anthropic API key — copy .env.example to .env.local and set VITE_ANTHROPIC_API_KEY.',
-      )
-    }
+    const issue = configurationIssue()
+    if (issue) s.setError(issue.message)
 
     // Pull the neural voice down during the boot sequence so the first
     // "Hey Jarvis" isn't waiting on an 86MB download. Deliberately not awaited
