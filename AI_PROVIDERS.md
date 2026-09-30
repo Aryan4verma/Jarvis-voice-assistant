@@ -19,7 +19,7 @@ modules perform no network requests, polling, model loading, or background work.
   error and unknown. An absent/unrecognized provider stop reason stays unknown.
 - `AIUsage`: optional input/output/cache token counts and optional reported or
   estimated USD cost. Missing values stay absent; missing does not mean zero.
-  Direct continuation totals include only fields known for every request.
+  Chat continuation totals include only fields known for every request.
 - `AIError` / `AIProviderError`: authentication, rate-limit, timeout, unavailable,
   invalid-request, model-unavailable, cancelled, network or unknown. Only safe
   adapter-owned messages, allowlisted codes, provider IDs and numeric HTTP status
@@ -36,12 +36,15 @@ the normalized interface.
 
 | Path | Responsibility |
 | --- | --- |
-| `bridge/providers/index.mjs` | Select the bridge adapter once at startup. Currently accepts only `claude-agent`; unsupported selections fail explicitly. |
+| `bridge/providers/index.mjs` | Select Claude Agent or OpenRouter on Node; configuration changes cancel the old turn before replacing its adapter. |
 | `bridge/providers/claude-agent.mjs` | Claude Agent SDK query options, stream parsing, tool deduplication/status, permission callback, session resume, images, usage/errors and SDK abort/close. One instance per connection; only a successful session ID survives a turn. |
+| `bridge/providers/openrouter.mjs` | Backend streaming chat, capabilities, function continuations, usage/errors and fetch cancellation. |
+| `bridge/providers/openrouter-client.mjs` | Fixed OpenRouter endpoint, SSE framing and on-demand bounded model catalog. |
+| `bridge/ai-settings.mjs` / `bridge/secrets.mjs` | Safe settings DTOs and external per-user preferences/DPAPI key storage. |
 | `bridge/server.mjs` | Authenticated transport, limits, immutable turn scope and per-turn local tool services. Delegates AI events to the adapter; adds scope/turn ID to wire events. |
 | `src/lib/bridge.ts` | Transport adapter: consume normalized events, retain socket/turn guards, camera cleanup, disconnect/reconnect and timeout behavior. Provider metadata/history mode arrives on connection-scoped ready frames. |
-| `src/lib/anthropic.ts` | Compatibility chat adapter for the existing direct browser Messages API path. Owns SDK types, hosted/remote tools, model options and bounded `pause_turn` continuation. |
-| `shared/providers/anthropic.mjs` | Provider-specific stop/error/usage and image translation shared by these two adapters. Not part of the generic message contract. |
+| `src/lib/anthropic.ts` | Fail-closed compatibility stub. Browser-direct permanent AI keys are retired. |
+| `shared/providers/anthropic.mjs` | Claude-specific stop/error/usage and image translation. Not part of the generic message contract. |
 
 The bridge adapter also exposes `start()` to the host, returning a result promise
 and idempotent `cancel()` receipt. Its optional per-operation runtime services
@@ -69,17 +72,11 @@ fake Agent SDK equivalence in this foundation.
 
 ## Configuration and future adapters
 
-`src/config.ts` exposes `AI_SELECTION` as non-secret transport/provider/model
-metadata. Existing `VITE_BACKEND` selects bridge or direct. The bridge owns its
-model via `JARVIS_MODEL`, effort via `JARVIS_EFFORT`, and adapter selection via
-optional `JARVIS_AI_PROVIDER=claude-agent`. Defaults are preserved.
-
-To add a future provider, implement the contract at the adapter boundary, map its
-chunks/reasons/errors/usage, supply honest capabilities and register it at the
-selection seam. UI message/history/TTS consumers need no provider-specific
-branches. Backend adapters use the same request/events/interaction contracts and
-the host operation/cancellation boundary; ordinary chat must not assume SDK MCP
-services. Extend selection centrally when that provider actually exists.
+All frontend AI uses the authenticated bridge. Provider/model mode selection is
+stored on Node through AI Settings. Claude model/effort retain JARVIS_MODEL and
+JARVIS_EFFORT. OpenRouter modes use user-chosen mappings and capability metadata.
+See [OpenRouter settings](OPENROUTER_SETTINGS.md) for storage, supported functions,
+readiness and cancellation limitations.
 
 The bridge can carry bounded neutral message history for a backend declaring
 `historyMode: messages`; current Claude session turns still send only the latest
@@ -87,12 +84,6 @@ user content. Before metadata arrives the transport can send history, which the
 Claude adapter ignores. Wire limits allow at most 32 messages, 256 KiB of total
 text (32 KiB per message), and 4 MiB of total encoded image data, within the
 existing WebSocket frame limit. Existing text-only request frames remain accepted.
-
-No new provider, API-key UI or credential storage is implemented here. The legacy
-direct path still reads its existing `VITE_ANTHROPIC_API_KEY` and remote MCP
-configuration internally and uses `dangerouslyAllowBrowser`. That key is exposed
-in the browser bundle; abstraction does not secure it. Bridge Claude login and
-the Phase 2 broker/session authentication are unchanged.
 
 ## Turn ownership and cancellation
 
@@ -104,12 +95,12 @@ owners. Only one primary interaction is active, including its speech tail.
 Cancellation quarantines output before requesting SDK abort and `Query.close()`.
 Receipts distinguish not-started, termination-requested and
 termination-unconfirmed; none claims remote execution or side effects were rolled
-back. Direct streams receive the original signal and call stream abort. A result
+back. OpenRouter fetch/body streams receive an operation signal linked to the original turn. A result
 that cannot terminate promptly remains quarantined. Terminal adapter cleanup
 also rejects late chunks/permission callbacks. Transport timeout/disconnect uses
 the existing turn cancellation path and clears pending camera/request state.
 Bridge failures retain the Phase 3 `TurnCancelled('error')` promise behavior while
-also delivering a normalized error event. Cancelled direct work returns reason
+also delivering a normalized error event. Cancelled chat work returns reason
 cancelled. The application adds no retries/replay of uncertain effectful requests;
 the Agent SDK's internal policies remain provider-owned.
 

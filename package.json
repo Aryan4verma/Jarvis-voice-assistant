@@ -15,6 +15,7 @@
     "lint": "oxlint",
     "test:security": "node --test tests/security.test.mjs tests/bridge-security.test.mjs",
     "test:lifecycle": "node --loader ./tests/frontend-loader.mjs --test tests/lifecycle.test.mjs tests/backend-lifecycle.test.mjs",
+    "test:openrouter": "node --test tests/openrouter.test.mjs tests/settings.test.mjs tests/openrouter-integration.test.mjs",
     "test:providers": "node --loader ./tests/frontend-loader.mjs --test tests/providers.test.mjs",
     "preview": "vite preview",
     "bridge": "node scripts/bridge.mjs",

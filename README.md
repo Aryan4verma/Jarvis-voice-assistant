@@ -258,6 +258,14 @@ then the triangular arc reactor lighting up — with a start-up sound under it
 Everything is optional in bridge mode. Frontend settings live in `.env.local`
 (copy `.env.example`); bridge settings are environment variables.
 
+### AI settings and typed chat
+
+Open **AI Settings** to choose OpenRouter, save a Windows-protected key, select
+FAST/BALANCED/DEEP model mappings, and test the connection. Typed chat works
+without enabling voice. Enter sends; STOP/Escape cancels. Claude Agent remains
+available. See [OpenRouter setup and security](OPENROUTER_SETTINGS.md).
+Browser-direct AI credentials are retired.
+
 ### Bridge
 
 | Variable | Default | Effect |
@@ -276,12 +284,10 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 
 | Variable | Effect |
 |---|---|
-| `VITE_BACKEND` | `bridge` (default) or `direct` |
 | `VITE_BRIDGE_URL` | Local bridge port used by the Node broker; remote hosts are refused |
 | `VITE_TTS_ENGINE` | `system` or `kokoro` |
 | `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
 | `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
-| `VITE_ANTHROPIC_API_KEY` | Direct mode only |
 
 ### Adding an ElevenLabs key
 

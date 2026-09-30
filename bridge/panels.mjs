@@ -327,7 +327,12 @@ export function displayServer(emit, emitBlade) {
     // Never defer this behind tool search — if the model has to go looking for
     // it, it won't occur to it to show anything.
     alwaysLoad: true,
-    tools: [
+    tools: displayTools(emit, emitBlade),
+  })
+}
+
+export function displayTools(emit, emitBlade) {
+  return [
       tool('display', DESCRIPTION, schema, async (args) => {
         // Refuse rather than warn. Emitting anyway put a blank card on screen
         // and told the model nothing, so it had no reason to try again; handed
@@ -422,8 +427,7 @@ export function displayServer(emit, emitBlade) {
           return { content: [{ type: 'text', text: JSON.stringify(report, null, 1) }] }
         },
       ),
-    ],
-  })
+  ]
 }
 
 const refuse = (text) => ({ isError: true, content: [{ type: 'text', text }] })

@@ -76,7 +76,7 @@ test('real bridge: cancelled query callbacks cannot relabel B; disconnect closes
   let logs = '', socket, child
   try {
     child = spawn(process.execPath, ['--loader',pathToFileURL(join(ROOT,'tests/sdk-loader.mjs')).href,'scripts/bridge.mjs'], {
-      cwd: ROOT, env: { ...process.env, JARVIS_RUNTIME_DIR:sandbox, JARVIS_BRIDGE_PORT:String(port), JARVIS_TEST_LIFECYCLE:'1', JARVIS_FILE_ROOTS:'', JARVIS_ALLOW_WRITES:'0' }, stdio:['ignore','pipe','pipe'],
+      cwd: ROOT, env: { ...process.env, LOCALAPPDATA: sandbox, JARVIS_AI_PROVIDER: 'claude-agent', JARVIS_RUNTIME_DIR:sandbox, JARVIS_BRIDGE_PORT:String(port), JARVIS_TEST_LIFECYCLE:'1', JARVIS_FILE_ROOTS:'', JARVIS_ALLOW_WRITES:'0' }, stdio:['ignore','pipe','pipe'],
     })
     child.stdout.on('data',chunk => { logs += chunk }); child.stderr.on('data',chunk => { logs += chunk })
     const state = await until(async () => JSON.parse(await readFile(join(sandbox,`${port}.json`),'utf8')))

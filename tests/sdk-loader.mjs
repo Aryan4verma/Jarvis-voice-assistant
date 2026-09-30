@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { ROOT } from '../scripts/runtime.mjs'
 
 const source = `
-export const tool = (name, description, schema, handler) => ({ name, handler });
+export const tool = (name, description, schema, handler) => ({ name, description, inputSchema: schema, handler });
 export const createSdkMcpServer = (options) => options;
 export function query({ prompt }) {
   const stream = (async function* () {
@@ -20,7 +20,7 @@ export function query({ prompt }) {
 }
 `
 const lifecycle = `
-export const tool = (name, description, schema, handler) => ({ name, handler });
+export const tool = (name, description, schema, handler) => ({ name, description, inputSchema: schema, handler });
 export const createSdkMcpServer = (options) => options;
 const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 export function query({ prompt, options }) {
@@ -77,6 +77,25 @@ export async function openRemote(url, headers, timeout) {
 }
 `
 export async function resolve(specifier, context, next) {
+  if (process.env.JARVIS_TEST_OPENROUTER === '1' && specifier === './providers/openrouter-client.mjs' && context.parentURL?.endsWith('/bridge/server.mjs')) {
+    const fixture = `
+      import { createRouterClient as realClient } from ${JSON.stringify(pathToFileURL(join(ROOT, 'bridge/providers/openrouter-client.mjs')).href)};
+      const frame = value => 'data: ' + JSON.stringify(value) + '\\n\\n';
+      export const createRouterClient = () => realClient(async (url, init) => {
+        if(url.endsWith('/models')) return Response.json({data:[{id:'fixture/model',name:'Fixture',architecture:{input_modalities:['text','image'],output_modalities:['text']},supported_parameters:['tools']}]});
+        if(url.endsWith('/key')) return Response.json({data:{label:'private-key-account-fixture'}});
+        const body=JSON.parse(init.body), last=body.messages.at(-1);
+        let chunks;
+        if(last.role==='user' && ['reset','look'].includes(last.content)) {
+          chunks=[{choices:[{delta:{tool_calls:[{index:0,id:'fixture-call',function:{name:last.content==='look' ? 'mcp__jarvis_eyes__look' : 'mcp__jarvis_ui__ui_reset',arguments:'{}'}}]},finish_reason:'tool_calls'}]}];
+        } else chunks=[{choices:[{delta:{content:'Mock streaming answer.'},finish_reason:'stop'}]}, {choices:[],usage:{prompt_tokens:4,completion_tokens:3}}];
+        const data=chunks.map(frame).join('')+'data: [DONE]\\n\\n';
+        if(last.content==='hold') return new Response(new ReadableStream({start(controller){controller.enqueue(new TextEncoder().encode(frame({choices:[{delta:{content:'Started.'}}]})));setTimeout(()=>{try{controller.enqueue(new TextEncoder().encode(data));controller.close()}catch{}},250)}}));
+        return new Response(data);
+      });
+    `
+    return { url: `data:text/javascript,${encodeURIComponent(fixture)}`, shortCircuit: true }
+  }
   if (specifier === '@anthropic-ai/claude-agent-sdk') {
     return { url: `data:text/javascript,${encodeURIComponent(process.env.JARVIS_TEST_LIFECYCLE === '1' ? lifecycle : source)}`, shortCircuit: true }
   }

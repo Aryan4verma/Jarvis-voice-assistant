@@ -1896,3 +1896,23 @@ kbd {
   transform: scaleX(-1);
   background: #000;
 }
+
+/* Small typed-chat/settings additions; existing HUD and scene stay intact. */
+.chat-input { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); width: min(720px, calc(100vw - 28px)); z-index: 30; padding: 12px; background: #080e16f5; border: 1px solid #416478; color: #d7ecf4; }
+.chat-controls, .chat-send, .ai-actions, .ai-settings-heading { display: flex; gap: 8px; align-items: center; }
+.chat-controls { margin-bottom: 8px; }
+.chat-controls label { flex: 1; }
+.chat-send input { flex: 1; min-width: 0; }
+.chat-input small { display: block; margin-top: 8px; overflow-wrap: anywhere; }
+.chat-input button, .ai-settings button { cursor: pointer; }
+.chat-input button, .chat-input input, .ai-settings button, .ai-settings input, .ai-settings select { padding: 8px; color: #d7ecf4; background: #10202e; border: 1px solid #416478; font: inherit; }
+.chat-input button:disabled, .ai-settings button:disabled { opacity: .5; cursor: default; }
+.ai-settings { width: min(620px, calc(100vw - 32px)); max-height: 85vh; overflow-y: auto; margin: auto; padding: 20px; color: #d7ecf4; background: #080e16; border: 1px solid #416478; font: 14px/1.5 system-ui, sans-serif; }
+.ai-settings::backdrop { background: #000b; }
+.ai-settings-heading { justify-content: space-between; }
+.ai-settings label { display: grid; gap: 5px; margin: 14px 0 6px; }
+.ai-settings select { width: 100%; min-width: 0; }
+.ai-settings p { margin: 12px 0; }
+.ai-settings small { color: #b0c5ce; }
+.ai-actions { flex-wrap: wrap; margin: 14px 0; }
+@media (max-width: 540px) { .chat-controls { flex-wrap: wrap; } .chat-controls label { flex-basis: 100%; } }

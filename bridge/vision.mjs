@@ -79,7 +79,12 @@ export function visionServer(ask) {
       'you to look at something. It is not a sensor to poll; it is an act.',
     // Behind tool search, "look at me" would find nothing and become an apology.
     alwaysLoad: true,
-    tools: [
+    tools: visionTools(ask),
+  })
+}
+
+export function visionTools(ask) {
+  return [
       tool(
         'look',
         DESCRIPTION,
@@ -208,6 +213,5 @@ export function visionServer(ask) {
           }
         },
       ),
-    ],
-  })
+  ]
 }

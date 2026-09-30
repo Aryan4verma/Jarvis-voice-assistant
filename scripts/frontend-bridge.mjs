@@ -19,7 +19,7 @@ export function localBridgePlugin(port) {
     }
     const headers = (req, origin, state, authenticated) => {
       const out = { host: `127.0.0.1:${port}`, origin }
-      for (const name of ['content-type', 'content-length', 'x-jarvis-turn', 'range', 'accept', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-protocol']) {
+      for (const name of ['content-type', 'content-length', 'x-jarvis-turn', 'x-jarvis-settings', 'range', 'accept', 'sec-websocket-key', 'sec-websocket-version', 'sec-websocket-protocol']) {
         if (req.headers[name]) out[name] = req.headers[name]
       }
       if (authenticated) out.authorization = `Bearer ${state.token}`

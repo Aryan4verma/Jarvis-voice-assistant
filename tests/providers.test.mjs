@@ -50,17 +50,6 @@ function queryDouble(chunks, inspect = () => {}) {
     return stream
   }
 }
-function directStream(final, emit = () => {}, inspect = () => {}) {
-  return (params, options) => {
-    inspect(params, options)
-    const callbacks = {}
-    return {
-      on(name, handler) { callbacks[name] = handler }, abort() {},
-      async finalMessage() { emit(callbacks); return final },
-    }
-  }
-}
-
 test('stop reasons normalize independently of provider wire values', () => {
   for (const [wire, expected] of [['end_turn','complete'],['stop_sequence','complete'],['max_tokens','max-tokens'],
     ['model_context_window_exceeded','max-tokens'],['tool_use','tool-continuation'],['pause_turn','tool-continuation'],
@@ -235,71 +224,12 @@ test('Claude runtime exceptions expose safe categories and unknown stop values r
   assert.throws(()=>bridgeProviderFactory({providerId:'future-provider'}),/Unsupported JARVIS AI provider/)
 })
 
-test('direct chat adapter converts generic images, streams tools and normalizes completion/usage', async () => {
-  const events=[]; let params, options
-  globalThis.__directStream=directStream({content:[],stop_reason:'end_turn',usage:{input_tokens:8,output_tokens:9}},callbacks=>{
-    callbacks.text('Hello. ')
-    callbacks.streamEvent({type:'content_block_start',content_block:{type:'server_tool_use',name:'web_search',id:'search'}})
-  },(p,o)=>{params=p;options=o})
-  const owner=createTurnOwner(), turn=owner.begin()
-  const answer=await direct.adapter.generate(request([{type:'text',text:'See'},{type:'image',mimeType:'image/png',data:'eA=='}]),{onEvent:event=>events.push(event)},turn)
-  assert.equal(direct.adapter.historyMode,'messages'); assert.equal(direct.adapter.describe().kind,'chat')
-  assert.equal(options.signal,turn.signal); assert.equal(options.maxRetries,0)
-  assert.equal(params.messages[0].content[1].source.media_type,'image/png')
-  assert.deepEqual(events.map(event=>event.type),['text','tool','usage','done'])
-  assert.equal(events[1].displayName,'web search'); assert.equal(answer.reason,'complete')
-  assert.deepEqual(answer.usage,{inputTokens:8,outputTokens:9}); assert.equal(answer.usage.cost,undefined)
+test('retired browser-direct adapter fails closed without creating a provider request', async () => {
+  const owner=createTurnOwner(), turn=owner.begin(), events=[]
+  globalThis.__directStream=()=>assert.fail('Browser secret path must not be used')
+  await assert.rejects(direct.adapter.generate(request('Question'),{onEvent:event=>events.push(event)},turn),error=>error.category==='invalid-request')
+  assert.equal(direct.adapter.describe(),null); assert.deepEqual(events,[]); assert.equal(turn.current(),true)
   turn.complete()
-})
-
-test('direct continuations preserve private tool context, remain bounded and aggregate only known usage', async () => {
-  const params=[], events=[]
-  globalThis.__directStream=directStream({content:[{type:'server_tool_use',name:'web_search',id:'fixture'}],stop_reason:'pause_turn',usage:{input_tokens:1,output_tokens:2}},
-    callbacks=>callbacks.text('Part. '),(p)=>params.push(p))
-  const owner=createTurnOwner(), turn=owner.begin()
-  const answer=await direct.adapter.generate(request('Question'),{onEvent:event=>events.push(event)},turn)
-  assert.equal(params.length,4); assert.equal(params[1].messages[1].content[0].type,'server_tool_use')
-  assert.equal(answer.reason,'tool-continuation'); assert.deepEqual(answer.usage,{inputTokens:4,outputTokens:8})
-  assert.equal(events.filter(event=>event.type==='done').length,1); turn.complete()
-})
-
-test('direct terminal limits/refusals and whole-message fallback retain audible text', async () => {
-  for(const [stop,reason] of [['max_tokens','max-tokens'],['refusal','refused'],['new_stop','unknown']]) {
-    const seen=[], owner=createTurnOwner(), turn=owner.begin()
-    globalThis.__directStream=directStream({content:[{type:'text',text:'Whole answer.'}],stop_reason:stop})
-    const answer=await direct.adapter.generate(request('Question'),{onEvent:event=>seen.push(event)},turn)
-    assert.equal(answer.reason,reason); assert.equal(answer.usage,undefined)
-    assert.equal(seen.at(-1).type,'done'); assert.ok(seen.some(event=>event.type==='text'))
-    if(stop==='max_tokens') assert.ok(answer.text.includes('There is more'))
-    if(stop==='refusal') assert.ok(answer.text.includes("can't help"))
-    turn.complete()
-  }
-})
-
-test('direct errors normalize without blindly retrying an uncertain request', async () => {
-  let calls=0; const events=[], owner=createTurnOwner(), turn=owner.begin()
-  globalThis.__directStream=()=>{calls++; throw Object.assign(new Error('private-fixture'),{status:429})}
-  await assert.rejects(direct.adapter.generate(request('Question'),{onEvent:event=>events.push(event)},turn),error=>error.category==='rate-limit')
-  assert.equal(calls,1); assert.equal(events[0].error.category,'rate-limit')
-  assert.ok(!JSON.stringify(events).includes('private-fixture')); turn.complete()
-})
-
-test('direct abort uses the original signal and old callbacks cannot affect B', async () => {
-  const final=deferred(), events=[], owner=createTurnOwner(); let callbacks, aborted=0, signal
-  globalThis.__directStream=(_params,options)=>{
-    signal=options.signal; callbacks={}
-    return {on(name,handler){callbacks[name]=handler},abort(){aborted++},finalMessage:()=>final.promise}
-  }
-  const a=owner.begin(), first=direct.adapter.generate(request('A'),{onEvent:event=>events.push(event)},a)
-  callbacks.text('A.'); a.cancel('stop')
-  const old=callbacks; assert.equal(signal.aborted,true); assert.equal(aborted,1)
-  globalThis.__directStream=directStream({content:[],stop_reason:'end_turn'},cb=>cb.text('B.'))
-  const b=owner.begin(), second=await direct.adapter.generate(request('B'),{onEvent:event=>events.push(event)},b)
-  old.text('Late A.'); old.streamEvent({type:'content_block_start',content_block:{type:'server_tool_use',name:'late',id:'late'}})
-  final.resolve({content:[],stop_reason:'end_turn'}); assert.equal((await first).reason,'cancelled')
-  assert.equal(second.text,'B.'); assert.equal(b.current(),true)
-  assert.deepEqual(events.filter(event=>event.type==='text').map(event=>event.delta),['A.','B.'])
-  b.complete()
 })
 
 test('brain consumes only neutral bridge events and keeps authoritative turn IDs through cancellation', async () => {
@@ -331,7 +261,7 @@ test('generic frontend message contracts have no provider SDK type imports', asy
 })
 
 test('cancellation during provider handle creation still closes the returned work', async () => {
-  let closes=0, aborts=0
+  let closes=0
   const owner=createTurnOwner(), a=owner.begin()
   const agent=createClaudeAgentAdapter(config,args=>{
     a.cancel('stop')
@@ -342,13 +272,7 @@ test('cancellation during provider handle creation still closes the returned wor
   const operation=agent.start(request('A'),{onEvent:()=>assert.fail('Cancelled event')},a)
   assert.equal((await operation.result).reason,'cancelled')
   assert.equal(operation.cancel(),'termination-requested'); assert.equal(closes,1)
-  const b=owner.begin()
-  globalThis.__directStream=()=>{
-    b.cancel('stop')
-    return {abort(){aborts++},on(){assert.fail('Cancelled stream listener')},finalMessage(){assert.fail('Cancelled stream wait')}}
-  }
-  assert.equal((await direct.adapter.generate(request('B'),{onEvent:()=>assert.fail('Cancelled event')},b)).reason,'cancelled')
-  assert.equal(aborts,1)
+
 })
 
 test('brain forwards generic image blocks with original ownership and surfaces categorized bridge errors', async () => {
@@ -364,16 +288,6 @@ test('brain forwards generic image blocks with original ownership and surfaces c
   assert.ok(ws.sent.some(frame=>frame.type==='cancel' && frame.turnId===a.turnId))
 })
 
-test('finished direct adapter rejects late callbacks while its turn remains active for speech', async () => {
-  let callbacks; const events=[], owner=createTurnOwner(), turn=owner.begin()
-  globalThis.__directStream=directStream({content:[],stop_reason:'end_turn'},cb=>{callbacks=cb;cb.text('Answer.')})
-  await direct.adapter.generate(request('Question'),{onEvent:event=>events.push(event)},turn)
-  callbacks.text('Late text.')
-  callbacks.streamEvent({type:'content_block_start',content_block:{type:'server_tool_use',id:'late',name:'late'}})
-  assert.equal(turn.current(),true); assert.deepEqual(events.map(event=>event.type),['text','done'])
-  turn.complete()
-})
-
 test('bridge adapter forwards bounded neutral history when a backend requests messages', async () => {
   await brain.warm()
   const ws=sockets.at(-1)
@@ -385,4 +299,35 @@ test('bridge adapter forwards bounded neutral history when a backend requests me
   ws.frame({scope:'turn',turnId:turn.turnId,type:'done',text:'Answer.',reason:'complete'})
   assert.equal((await pending).reason,'complete'); assert.equal(bridge.adapter.historyMode,'messages')
   turn.complete()
+})
+
+test('typed chat delegates to the voice brain and retains immutable ownership on replacement', async () => {
+  const { submitTyped } = await import('../src/lib/chat.ts')
+  const pending=[], seen=[], owned=[]
+  const respond=(prompt,source)=>{
+    assert.equal(source,'typed'); const turn=turns.begin(); owned.push(turn)
+    const work=brain.ask(prompt,[],{onEvent:event=>seen.push(event)},turn)
+    work.catch(()=>{});pending.push(work);return work.catch(()=>{})
+  }
+  assert.equal(submitTyped('   ',respond),false)
+  assert.throws(()=>submitTyped('é'.repeat(17000),respond),/too long/)
+  assert.equal(submitTyped(' A ',respond),true); await flush()
+  const ws=sockets.at(-1), a=owned[0]
+  ws.frame({scope:'turn',turnId:a.turnId,type:'text',delta:'A.'})
+  assert.equal(submitTyped('B',respond),true); await assert.rejects(pending[0]); await flush()
+  const b=owned[1]
+  assert.ok(ws.sent.some(frame=>frame.type==='cancel' && frame.turnId===a.turnId))
+  ws.frame({scope:'turn',turnId:a.turnId,type:'text',delta:'Late A.'})
+  ws.frame({scope:'turn',turnId:a.turnId,type:'done',text:'Late A.'})
+  ws.frame({scope:'turn',turnId:b.turnId,type:'done',text:'B.',reason:'complete'})
+  assert.equal((await pending[1]).text,'B.'); assert.equal(b.current(),true)
+  assert.ok(!JSON.stringify(seen).includes('Late A.'))
+})
+
+test('cloud history is bounded by content bytes as well as message count', async () => {
+  const { boundedHistory } = await import('../src/lib/chat.ts')
+  const history=Array.from({length:20},(_,i)=>({role:i%2 ? 'assistant' : 'user',content:'x'.repeat(40000)}))
+  const bounded=boundedHistory(history)
+  assert.ok(bounded.length<=16); assert.ok(bounded.every(message=>message.content.length<=8000))
+  assert.equal(bounded[0].role,'user'); assert.ok(validRequest({messages:[...bounded,{role:'user',content:'Follow up'}]}))
 })

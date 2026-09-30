@@ -3,6 +3,8 @@ import { Scene } from './scene/Scene'
 import { Hud } from './ui/Hud'
 import { Boot } from './ui/Boot'
 import { Ignition } from './ui/Ignition'
+import { ChatInput } from './ui/ChatInput'
+import { boundedHistory } from './lib/chat'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
 import { startVoice, type Voice, type VoiceMode } from './lib/voice'
@@ -75,6 +77,7 @@ export default function App() {
   const interaction = useRef<Turn | null>(null)
   const lookingRequest = useRef<string | null>(null)
   const booting = useRef(false)
+  const channelsReady = useRef(false)
   const lifetime = useRef(new AbortController())
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -117,7 +120,9 @@ export default function App() {
 
   // -- one turn -------------------------------------------------------------
 
-  const respond = async (said: string): Promise<void> => {
+  const respond = async (said: string, source: 'voice' | 'typed' = 'voice'): Promise<void> => {
+    registerBridgeHandlers()
+    const spoken = source === 'voice'
     silence()
     const mine = turns.begin()
     interaction.current = mine
@@ -137,7 +142,10 @@ export default function App() {
         store.getState().setError(reason === 'timeout'
           ? 'Interaction timed out. Backend termination requested; late output is ignored.'
           : reason === 'disconnect' ? 'Bridge disconnected. This interaction was cancelled.' : mine.signal.reason.message)
-        listen(FOLLOW_UP_MS)
+        if (spoken && voice.current) listen(FOLLOW_UP_MS)
+        else store.getState().setPhase('dormant')
+      } else if (reason !== 'replaced') {
+        store.getState().setPhase('dormant')
       }
     }
     mine.signal.addEventListener('abort', cancelled, { once: true })
@@ -149,10 +157,11 @@ export default function App() {
     s.clearPanels()
     s.clearBlades()
     s.setCaption('')
+    s.setError(null)
     s.pushTurn({ id: `${mine.turnId}:user`, role: 'user', text: said })
     s.setPhase('thinking')
 
-    const spk = createSpeaker(mine)
+    const spk = spoken ? createSpeaker(mine) : null
     speaker.current = spk
     sfx.duck(true)
     music.duck(true)
@@ -177,7 +186,7 @@ export default function App() {
               store.getState().pushTurn({ id: turnId, role: 'jarvis', text: '' })
             }
             store.getState().appendToLastTurn(delta)
-            spk.push(delta)
+            spk?.push(delta)
           } else if (event.type === 'tool') {
             const name = event.displayName ?? event.name
             // Only claim the tooling phase while he has nothing to say yet.
@@ -186,14 +195,14 @@ export default function App() {
             // which also broke the reactor's lip-sync for the remainder.
             if (!started) store.getState().setPhase('tooling')
             store.getState().setActiveTool(name)
-            sfx.play('tool')
-            music.working(true)
+            if (spoken) sfx.play('tool')
+            if (spoken) music.working(true)
             // Say something the moment work starts — a tool can take ten seconds
             // and silence that long reads as a crash. Once per turn only; a
             // chain of five tools shouldn't produce five apologies.
             if (!filled && !started) {
               filled = true
-              spk.say(forTool(name))
+              spk?.say(forTool(name))
             }
           }
         },
@@ -204,16 +213,16 @@ export default function App() {
       // Bounded application messages; session adapters ignore this history.
       history.current.push({ role: 'user', content: said })
       history.current.push({ role: 'assistant', content: text || '…' })
-      if (history.current.length > 16) history.current = history.current.slice(-16)
+      history.current = boundedHistory(history.current)
 
-      await spk.end()
+      await spk?.end()
       if (stale()) return
-      sfx.play('done')
+      if (spoken) sfx.play('done')
     } catch (err) {
       if (stale()) return
-      spk.cancel()
+      spk?.cancel()
       console.warn('[jarvis] interaction failed')
-      sfx.play('error')
+      if (spoken) sfx.play('error')
       store
         .getState()
         .setError(err instanceof Error ? err.message : 'Something went wrong.')
@@ -229,7 +238,8 @@ export default function App() {
         music.working(false)
         // Stay open. Having to say his name again to add one more sentence is
         // the difference between a conversation and a vending machine.
-        listen(FOLLOW_UP_MS)
+        if (spoken && voice.current) listen(FOLLOW_UP_MS)
+        else store.getState().setPhase('dormant')
       }
     }
   }
@@ -332,55 +342,9 @@ export default function App() {
     store.getState().setError(message)
   }
 
-  // -- power on -------------------------------------------------------------
-
-  const powerOn = async () => {
-    // The ignition button and the space bar can both land here, and the phase
-    // only moves after the first await — so without this a double press boots
-    // twice, arming two voice loops and two download polls.
-    if (booting.current) return
-    booting.current = true
-    const signal = lifetime.current.signal
-
-    try {
-      await ignite()
-    } catch (err) {
-      if (signal.aborted) return
-      // The guard must not outlive a failed boot. Audio unlock can be refused,
-      // the microphone prompt dismissed, the bridge unreachable at the wrong
-      // moment — and with the flag still latched the ignition button was dead
-      // for the rest of the page, recoverable only by reloading. Reset it and
-      // put the button back so the user can simply press it again.
-      booting.current = false
-      console.error('[jarvis] power-up failed:', err)
-      store.getState().setPhase('offline')
-      store
-        .getState()
-        .setError(
-          err instanceof Error
-            ? `Power-up failed: ${err.message}`
-            : 'Power-up failed. Click to try again.',
-        )
-    }
-  }
-
-  const ignite = async () => {
-    const signal = lifetime.current.signal
-    const s = store.getState()
-
-    // Must happen inside the click handler — browsers won't start an
-    // AudioContext or speech synthesis without a user gesture.
-    await sfx.unlockAudio()
-    signal.throwIfAborted()
-    sfx.play('boot')
-    // The score. Must be started from inside this click handler for the same
-    // reason as the rest of the audio.
-    music.enable()
-    music.playBoot()
-    music.startAmbient()
-
-    s.setPhase('boot')
-
+  const registerBridgeHandlers = () => {
+    if (channelsReady.current) return
+    channelsReady.current = true
     watchServers((servers) => store.getState().setConnected(servers))
     watchPanels((panel) => store.getState().pushPanel(panel))
     watchBlades((blade) => store.getState().pushBlade(blade))
@@ -480,9 +444,61 @@ export default function App() {
       } else if (state === 'reconnected') {
         store
           .getState()
-          .setError('Bridge reconnected. The previous conversation was not kept.')
+          .setError('Bridge reconnected. Agent sessions restart; recent chat text remains available.')
       }
     })
+  }
+
+  // -- power on -------------------------------------------------------------
+
+  const powerOn = async () => {
+    // The ignition button and the space bar can both land here, and the phase
+    // only moves after the first await — so without this a double press boots
+    // twice, arming two voice loops and two download polls.
+    if (booting.current) return
+    booting.current = true
+    const signal = lifetime.current.signal
+
+    try {
+      await ignite()
+    } catch (err) {
+      if (signal.aborted) return
+      // The guard must not outlive a failed boot. Audio unlock can be refused,
+      // the microphone prompt dismissed, the bridge unreachable at the wrong
+      // moment — and with the flag still latched the ignition button was dead
+      // for the rest of the page, recoverable only by reloading. Reset it and
+      // put the button back so the user can simply press it again.
+      booting.current = false
+      console.error('[jarvis] power-up failed:', err)
+      store.getState().setPhase('offline')
+      store
+        .getState()
+        .setError(
+          err instanceof Error
+            ? `Power-up failed: ${err.message}`
+            : 'Power-up failed. Click to try again.',
+        )
+    }
+  }
+
+  const ignite = async () => {
+    const signal = lifetime.current.signal
+    const s = store.getState()
+
+    // Must happen inside the click handler — browsers won't start an
+    // AudioContext or speech synthesis without a user gesture.
+    await sfx.unlockAudio()
+    signal.throwIfAborted()
+    sfx.play('boot')
+    // The score. Must be started from inside this click handler for the same
+    // reason as the rest of the audio.
+    music.enable()
+    music.playBoot()
+    music.startAmbient()
+
+    s.setPhase('boot')
+
+    registerBridgeHandlers()
     const warming = warm().catch((err: Error) => { if (!signal.aborted) s.setError(err.message) })
 
     const issue = configurationIssue()
@@ -602,8 +618,16 @@ export default function App() {
     pump()
 
     const onKey = (e: KeyboardEvent) => {
+      // Escape stands the whole thing down — the one thing the old build had
+      // no key for at all.
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        if (store.getState().phase !== 'offline') goDormant()
+        return
+      }
+
       const tag = (e.target as HTMLElement)?.tagName
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (e.target as HTMLElement)?.isContentEditable) return
 
       // V auditions the next British voice installed on this machine. Which
       // ones exist varies per Mac, so hearing them beats trusting a ranking.
@@ -679,14 +703,6 @@ export default function App() {
         return
       }
 
-      // Escape stands the whole thing down — the one thing the old build had
-      // no key for at all.
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        if (store.getState().phase !== 'offline') goDormant()
-        return
-      }
-
       // Space starts a turn without the wake word. Worth using while filming so
       // a missed wake word doesn't cost a take.
       if (e.code !== 'Space' || e.repeat) return
@@ -714,6 +730,7 @@ export default function App() {
       cancelAnimationFrame(raf)
       window.removeEventListener('keydown', onKey)
       lifetime.current.abort()
+      channelsReady.current = false
       clearIdle()
       shutdown()
       if (voicePoll.current) clearInterval(voicePoll.current)
@@ -731,6 +748,7 @@ export default function App() {
       <Hud />
       <Boot />
       <Diagnostics />
+      <ChatInput respond={respond} onStop={goDormant} onVoice={() => void powerOn()} />
       <Ignition onStart={() => void powerOn()} />
     </>
   )

@@ -19,10 +19,15 @@ import { WebSocketServer } from 'ws'
 import { once } from 'node:events'
 import { bridgeProviderFactory } from './providers/index.mjs'
 import { aiError, validRequest } from '../shared/ai.mjs'
-import { displayServer } from './panels.mjs'
-import { uiServer } from './ui.mjs'
+import { displayServer, displayTools } from './panels.mjs'
+import { uiServer, uiTools } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
-import { visionServer } from './vision.mjs'
+import { visionServer, visionTools } from './vision.mjs'
+import { createSecretStore } from './secrets.mjs'
+import { createRouterClient } from './providers/openrouter-client.mjs'
+import { createAISettings } from './ai-settings.mjs'
+import { settingsHTTP } from './settings-http.mjs'
+import { functionTools } from './functions.mjs'
 import { createTurnScope } from './turn.mjs'
 import { homedir } from 'node:os'
 import { readFileSync } from 'node:fs'
@@ -138,10 +143,9 @@ const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
  * dead air shows.
  */
 const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
-const createProvider = bridgeProviderFactory({
-  providerId: process.env.JARVIS_AI_PROVIDER?.trim() || 'claude-agent',
-  modelId: MODEL, reasoningEffort: EFFORT,
-})
+const secrets = createSecretStore()
+const routerClient = createRouterClient()
+const aiSettings = await createAISettings({ secrets, client: routerClient, claudeModel: MODEL })
 
 /**
  * Both spellings of every renamed built-in are listed on purpose. The SDK
@@ -651,8 +655,8 @@ function corsFor(req) {
   const headers = { vary: 'origin' }
   if (origin) {
     headers['access-control-allow-origin'] = origin
-    headers['access-control-allow-headers'] = 'content-type, authorization'
-    headers['access-control-allow-methods'] = 'GET, POST, OPTIONS'
+    headers['access-control-allow-headers'] = 'content-type, authorization, x-jarvis-settings'
+    headers['access-control-allow-methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
   }
   return headers
 }
@@ -708,12 +712,13 @@ const handleRequest = async (req, res) => {
     res.writeHead(413, { ...cors, connection: 'close' })
     return res.end('body too large')
   }
+  if (await settingsHTTP(req, res, { settings: aiSettings, client: routerClient, signal: requestAbort.signal, cors, originAllowed })) return
   if (req.method === 'GET' && route === '/readiness') {
     const speech = elevenKey() ? 'configured' : 'not-configured'
     res.writeHead(200, { ...cors, 'content-type': 'application/json', 'cache-control': 'no-store' })
     return res.end(JSON.stringify({
       ok: true,
-      ai: { configuration: process.env.ANTHROPIC_API_KEY ? 'configured' : 'unknown', readiness: 'not-validated' },
+      ai: await aiSettings.snapshot(),
       speech: { stt: speech, tts: speech, readiness: 'not-validated' },
       browser: browserState, mcp: mcpState,
     }))
@@ -1081,17 +1086,30 @@ wss.on('connection', (socket) => {
   socket.on('error', (err) => console.warn('[jarvis] websocket failed:', errorLabel(err)))
   console.log('[jarvis] client connected')
   const send = (message) => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message)) }
-  const provider = createProvider({
-    systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
-    cwd: homedir(), decideTool, debug: process.env.JARVIS_DEBUG === '1',
-    onReady(servers) {
-      send({ scope: 'connection', type: 'ready', servers, provider: provider.describe(), historyMode: provider.historyMode })
-      mcpState = 'loaded; status supplied by agent'
-      console.log(`[jarvis] ${servers.length} MCP servers available`)
-    },
-  })
-  send({ scope: 'connection', type: 'ready', servers: Object.keys(MCP_SERVERS), provider: provider.describe(), historyMode: provider.historyMode })
-  let active = null, closed = false
+  let active = null, closed = false, provider
+  const ready = servers => send({ scope: 'connection', type: 'ready', servers,
+    provider: provider.describe(), historyMode: provider.historyMode })
+  const buildProvider = () => {
+    const selection = aiSettings.selection()
+    const instance = bridgeProviderFactory({ ...selection, reasoningEffort: EFFORT })({
+      client: routerClient, getKey: signal => secrets.read(signal), decideTool,
+      systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
+      cwd: homedir(), debug: process.env.JARVIS_DEBUG === '1',
+      onReady(servers) {
+        if (closed || provider !== instance) return
+        ready(servers)
+        mcpState = 'loaded; status supplied by agent'
+      },
+      onInfo() { if (!closed && provider === instance) ready([]) },
+    })
+    return instance
+  }
+  const initialReady = () => ready(provider.describe().kind === 'agent' ? Object.keys(MCP_SERVERS) : [])
+  provider = buildProvider()
+  initialReady()
+  void aiSettings.snapshot().then(settings => {
+    if (!closed) send({ scope: 'connection', type: 'provider-state', settings })
+  }).catch(() => {})
   const recentIds = new Set()
   const messageAllowed = createRateLimit(240), askAllowed = createRateLimit(20)
   const cancel = (turn, reason) => {
@@ -1102,8 +1120,16 @@ wss.on('connection', (socket) => {
     send({ scope: 'turn', type: 'cancelled', turnId: turn.scope.turnId, reason, backend })
     if (active === turn) active = null
   }
+  const unsubscribe = aiSettings.subscribe(changed => {
+    if (closed) return
+    if (changed) { cancel(active, 'settings-changed'); provider = buildProvider(); initialReady() }
+    void aiSettings.snapshot().then(settings => {
+      if (!closed) send({ scope: 'connection', type: 'provider-state', settings })
+    }).catch(() => {})
+  })
   const disconnect = () => {
     closed = true
+    unsubscribe()
     cancel(active, 'disconnect')
     recentIds.clear()
     connections.delete(disconnect)
@@ -1117,19 +1143,29 @@ wss.on('connection', (socket) => {
     try {
       if (!scope.live() || closed) return
       // Tool callbacks still close over this immutable scope, never active.
-      const mcpServers = {
+      const panel = value => scope.send({ type: 'panel', panel: value })
+      const blade = value => scope.send({ type: 'blade', blade: value })
+      const ui = (op, args) => scope.send({ type: 'ui', op, args })
+      const runtime = turn.provider.describe().kind === 'agent' ? { mcpServers: {
         ...MCP_SERVERS,
-        jarvis: displayServer(
-          (panel) => scope.send({ type: 'panel', panel }),
-          (blade) => scope.send({ type: 'blade', blade }),
-        ),
-        jarvis_ui: uiServer((op, args) => scope.send({ type: 'ui', op, args })),
+        jarvis: displayServer(panel, blade),
+        jarvis_ui: uiServer(ui),
         jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES, signal: scope.signal }),
         jarvis_eyes: visionServer(scope.request),
-      }
-      turn.operation = provider.start(request, {
-        onEvent: event => scope.send(event),
-      }, { turnId: scope.turnId, signal: scope.signal, current: scope.live }, { mcpServers })
+      }} : { functionTools: [
+        ...functionTools('jarvis', displayTools(panel, blade)),
+        ...functionTools('jarvis_ui', uiTools(ui)),
+        ...functionTools('jarvis_eyes', visionTools(scope.request), { vision: true }),
+      ]}
+      turn.operation = turn.provider.start(request, {
+        onEvent: event => {
+          scope.send(event)
+          if (scope.live() && turn.provider.describe().providerId === 'openrouter') {
+            if (event.type === 'error') aiSettings.report(turn.revision, event.error)
+            else if (event.type === 'done') aiSettings.report(turn.revision)
+          }
+        },
+      }, { turnId: scope.turnId, signal: scope.signal, current: scope.live }, runtime)
       await turn.operation.result
     } catch (err) {
       if (scope.live() && !closed) {
@@ -1164,7 +1200,7 @@ wss.on('connection', (socket) => {
       cancel(active, 'replaced')
       recentIds.add(id)
       if (recentIds.size > 64) recentIds.delete(recentIds.values().next().value)
-      const turn = { scope: createTurnScope(id, send), operation: null }
+      const turn = { scope: createTurnScope(id, send), operation: null, provider, revision: aiSettings.selection().revision }
       active = turn
       void run(turn, request)
     } else if (msg.type === 'reply') active?.scope.reply(msg)

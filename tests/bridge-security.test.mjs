@@ -43,7 +43,7 @@ test('real loopback bridge and Vite broker enforce authenticated routes and limi
   let logs = ''
   const launch = (args) => {
     const child = spawn(process.execPath, args, { cwd: ROOT, env: {
-      ...process.env, JARVIS_RUNTIME_DIR: sandbox, JARVIS_BRIDGE_PORT: String(port),
+      ...process.env, LOCALAPPDATA: sandbox, JARVIS_AI_PROVIDER: 'claude-agent', JARVIS_RUNTIME_DIR: sandbox, JARVIS_BRIDGE_PORT: String(port),
       JARVIS_ALLOWED_ORIGINS: origin, JARVIS_ALLOW_WRITES: '0', JARVIS_MAX_STT: '1',
       JARVIS_MAX_SESSIONS: '1', JARVIS_FILE_ROOTS: '', ELEVENLABS_API_KEY: 'test-speech-key-not-real',
     }, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -73,10 +73,10 @@ test('real loopback bridge and Vite broker enforce authenticated routes and limi
       assert.ok([addresses].flat().every((address) => address === '127.0.0.1'), 'Bridge listener is not loopback-only')
     }
     assert.equal(await raw('/health', { host: `evil.example:${port}` }), 403)
-    for (const path of ['/readiness', '/file?path=C%3A%5Cprivate.png', '/img?url=https://example.com', '/media?url=https://example.com', '/page?url=https://example.com']) {
+    for (const path of ['/ai/settings', '/ai/models', '/readiness', '/file?path=C%3A%5Cprivate.png', '/img?url=https://example.com', '/media?url=https://example.com', '/page?url=https://example.com']) {
       assert.equal((await get(path)).status, 401)
     }
-    for (const path of ['/tts', '/stt']) assert.equal((await fetch(base + path, { method: 'POST' })).status, 401)
+    for (const path of ['/ai/key', '/ai/test', '/tts', '/stt']) assert.equal((await fetch(base + path, { method: 'POST' })).status, 401)
     const ready = await get('/readiness', auth)
     assert.equal(ready.status, 200)
     assert.equal((await ready.json()).speech.readiness, 'not-validated')

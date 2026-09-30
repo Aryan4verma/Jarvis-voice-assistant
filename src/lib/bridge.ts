@@ -1,6 +1,8 @@
 import { AIProviderError, aiError, completionReason, legacyEvents, readUsage, validContent, validRequest,
   type AIAdapter, type AIHandlers, type AIProviderInfo, type AIRequest, type AIResult,
   type AIUsage, type AIError, type LegacyAskHandlers } from './ai'
+import { acceptSettings, providerDisconnected } from './settings'
+import type { AISettings } from './settings'
 import type { Blade, Panel } from '../store'
 import { BRIDGE_WS_URL } from '../config'
 import { ensureBridgeSession } from './bridgeSession'
@@ -45,6 +47,7 @@ type Frame = {
   error?: AIError
   displayName?: string
   phase?: 'start' | 'activity'
+  settings?: AISettings
   historyMode?: 'messages' | 'session'
 }
 
@@ -182,6 +185,7 @@ function dispatch(ws: WebSocket) {
     let msg: Frame
     try { msg = JSON.parse(e.data as string) } catch { return }
     if (!msg || typeof msg !== 'object') return
+    if (msg.scope === 'connection' && msg.type === 'provider-state' && msg.settings) { acceptSettings(msg.settings); return }
     if (msg.scope === 'connection' && msg.type === 'ready') {
       providerInfo = msg.provider ?? null
       historyMode = msg.historyMode === 'session' ? 'session' : 'messages'
@@ -295,7 +299,7 @@ function connect(): Promise<WebSocket> {
       settle(new Error('The bridge closed the connection.'))
       if (socket === ws) {
         socket = null
-        providerInfo = null
+        providerInfo = null; providerDisconnected()
         historyMode = 'messages'
         if (pending?.ws === ws) pending.turn.cancel('disconnect')
         turns.cancel('disconnect') // Includes speech still draining after backend completion.
@@ -443,6 +447,6 @@ export function shutdown(): void {
   socket = null
   connecting = null
   servers = []
-  providerInfo = null
+  providerInfo = null; providerDisconnected()
   historyMode = 'messages'
 }

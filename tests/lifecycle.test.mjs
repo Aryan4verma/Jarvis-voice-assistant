@@ -206,20 +206,10 @@ test('reset browser recognition detaches old results/errors/restart callbacks', 
   } finally { voice.stop(); delete globalThis.SpeechRecognition }
 })
 
-test('direct stream abort and old finally callbacks cannot clear or relabel B', async () => {
-  const streams = []
-  globalThis.__directStream = (_params, options) => {
-    const final = deferred(), handlers = {}, stream = { on: (event, handler) => { handlers[event] = handler },
-      finalMessage: () => final.promise, abort: () => { stream.aborted = true }, final, handlers, options }
-    streams.push(stream); return stream
-  }
-  const seen = [], owner = createTurnOwner(), a = owner.begin()
-  const resultA = direct.ask([], { onText: (text) => seen.push(text), onTool() {} }, a)
-  a.cancel('stop'); const b = owner.begin()
-  const resultB = direct.ask([], { onText: (text) => seen.push(text), onTool() {} }, b)
-  assert.equal(streams[0].aborted, true); assert.equal(streams[1].options.maxRetries, 0)
-  streams[0].handlers.text('late-A'); streams[0].final.resolve({ stop_reason: 'end_turn' }); await resultA
-  assert.equal(b.current(), true); assert.equal(streams[1].aborted, undefined)
-  streams[1].handlers.text('B'); streams[1].final.resolve({ stop_reason: 'end_turn' }); await resultB
-  assert.deepEqual(seen, ['B'])
+test('retired browser-direct caller cannot emit output or disturb a newer interaction', async () => {
+  const seen=[], owner=createTurnOwner(), a=owner.begin()
+  globalThis.__directStream=()=>assert.fail('Browser direct requests are disabled')
+  await assert.rejects(direct.ask([],{onText:text=>seen.push(text),onTool(){}},a),error=>error.category==='invalid-request')
+  a.cancel('stop');const b=owner.begin()
+  assert.deepEqual(seen,[]);assert.equal(b.current(),true)
 })

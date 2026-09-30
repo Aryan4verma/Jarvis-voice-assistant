@@ -345,7 +345,12 @@ export function uiServer(emit) {
     // Same reasoning as the display server: behind tool search it would never
     // occur to the model that the interface is something it can touch.
     alwaysLoad: true,
-    tools: [
+    tools: uiTools(emit),
+  })
+}
+
+export function uiTools(emit) {
+  return [
       tool('ui_theme', THEME_DESCRIPTION, themeSchema, async (args) => {
         const patch = {}
         put(patch, 'accent', toColour(args.accent))
@@ -489,6 +494,5 @@ export function uiServer(emit) {
         emit('reset', {})
         return ok('Interface restored.')
       }),
-    ],
-  })
+  ]
 }
