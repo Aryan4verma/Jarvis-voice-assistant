@@ -25,3 +25,38 @@ dist-ssr
 
 # Copied out of node_modules by scripts/start.mjs — 34MB of build output.
 public/mediapipe/
+
+# Secrets and private machine configuration (keep the safe example tracked).
+.env
+.env.*
+!.env.example
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+/.claude/settings.json
+/.claude/settings.local.json
+/.claude/credentials.json
+/.claude/projects/
+/.claude/cache/
+
+# Personal memory, conversation exports, and SQLite sidecar files.
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+/data/
+/memory/
+/conversations/
+
+# Private captures and generated caches; bundled public assets remain tracked.
+/recordings/
+/screenshots/
+/captures/
+/cache/
+.cache/
+.vite/
+*.tsbuildinfo
