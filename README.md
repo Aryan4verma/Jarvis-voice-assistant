@@ -25,8 +25,10 @@ can have — Node.js and Chrome. That's the whole list.
   or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
   then run `claude` once and complete login. The bridge reuses that login. **No
   API key**, and usage is billed to your existing Claude account.
-- **Node.js 20 or newer** — free, one installer from <https://nodejs.org>. This
-  is a Node web app, so it is the one unavoidable tool.
+- **Node.js `^20.19.0 || >=22.12.0`** — Node 20 requires 20.19 or newer;
+  otherwise use 22.12 or newer. **Node 24 LTS is recommended.** This matches
+  the locked Vite, React plugin, and lint tooling. A supported installed version
+  does not need to be changed. Installers are at <https://nodejs.org>.
 - **Google Chrome or Microsoft Edge**, in a **real browser window** — not an
   embedded preview pane. Preview panes (including the one inside editors and
   Claude Code) block microphone access, so the page loads and looks right but
@@ -45,7 +47,7 @@ language.
 First, install, then start it:
 
 ```bash
-npm install
+npm ci             # reproducible installation from package-lock.json
 npm start          # runs the brain and the face together
 ```
 
@@ -54,7 +56,7 @@ Then open the URL it prints (http://localhost:5173) in **Chrome**, click **INITI
 Prefer two terminals? Run them separately instead:
 
 ```bash
-npm install
+npm ci
 ```
 
 Terminal 1 — the brain:
@@ -69,16 +71,45 @@ Terminal 2 — the face:
 npm run dev
 ```
 
-Then open the app in a **real Chrome or Edge window**:
+Then open the app in a **real Chrome or Edge window**. On Windows PowerShell:
 
-```bash
-open http://localhost:5173
+```powershell
+Start-Process http://localhost:5173
 ```
 
 Click **INITIALISE**, allow the microphone when asked, and say **"Hey Jarvis"**.
 
 > It has to be a real browser window. Embedded preview panes block the
 > microphone, so JARVIS will look perfectly alive and simply never respond.
+
+### Windows development/build baseline
+
+Run these commands from the repository directory:
+
+```bash
+npm ci
+npm run setup
+npm run build      # TypeScript project checks, then the production bundle
+npm run lint
+npm start
+```
+
+`npm start`, `npm run bridge`, and `npm run bridge:writes` use Node directly;
+the write-mode command does not require Unix environment-variable syntax.
+Ctrl-C stops the launcher and its two direct children. Full cleanup of optional
+agent/MCP descendant processes is a separate lifecycle concern.
+
+MediaPipe's pinned JavaScript/WASM runtime is prepared automatically for
+`start`, `dev`, `build`, and `preview`. The generated `public/mediapipe` directory
+is ignored by Git and copied into production output. Unchanged assets are reused;
+missing or incomplete assets are repaired. Optional hand-model weights still
+need network access when not already cached.
+
+`npm run preview` serves the production frontend; start `npm run bridge` in a
+second terminal for AI requests. There is currently no automated test suite.
+Setup is advisory and does not establish Claude login or microphone/camera
+permissions. The existing Chrome native-host transport still assumes Unix
+sockets; Windows browser automation remains a later compatibility task.
 
 ---
 

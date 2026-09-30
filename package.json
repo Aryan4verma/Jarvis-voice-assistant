@@ -6,7 +6,7 @@
   "license": "MIT",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "scripts": {
     "start": "node scripts/start.mjs",
@@ -14,8 +14,8 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "bridge": "node bridge/server.mjs",
-    "bridge:writes": "JARVIS_ALLOW_WRITES=1 node bridge/server.mjs",
+    "bridge": "node scripts/bridge.mjs",
+    "bridge:writes": "node scripts/bridge.mjs --writes",
     "setup": "node scripts/setup.mjs"
   },
   "dependencies": {

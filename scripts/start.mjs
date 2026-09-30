@@ -12,7 +12,10 @@
 
 import { spawn } from 'node:child_process'
 import process from 'node:process'
-import { cpSync, existsSync, mkdirSync } from 'node:fs'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { prepareMediaPipe } from './assets.mjs'
+import { assertSupportedNode, ROOT } from './runtime.mjs'
 
 /**
  * Put MediaPipe's WebAssembly where the page can actually load it.
@@ -31,17 +34,7 @@ import { cpSync, existsSync, mkdirSync } from 'node:fs'
  * after the first run.
  */
 function vendorWasm() {
-  const from = 'node_modules/@mediapipe/tasks-vision/wasm'
-  const to = 'public/mediapipe'
-  if (!existsSync(from)) return // gesture control is optional; carry on without it
-  if (existsSync(`${to}/vision_wasm_internal.wasm`)) return
-  try {
-    mkdirSync(to, { recursive: true })
-    cpSync(from, to, { recursive: true })
-    console.log('  vendored the hand-tracking runtime into public/mediapipe.')
-  } catch (err) {
-    console.warn(`  could not vendor the hand-tracking runtime: ${err.message}`)
-  }
+  prepareMediaPipe()
 }
 
 const writes = process.argv.includes('--writes')
@@ -60,16 +53,22 @@ const children = []
 function run(name, command, args, colour, env) {
   const label = paint(name, colour)
   const child = spawn(command, args, {
+    cwd: ROOT,
     env: { ...process.env, ...env },
     shell: false,
   })
   child.stdout.on('data', (d) => process.stdout.write(label(d) + '\n'))
   child.stderr.on('data', (d) => process.stderr.write(label(d) + '\n'))
-  child.on('exit', (code) => {
+  child.on('error', (err) => {
+    console.error(`[jarvis] Could not start ${name}: ${err.message}. Check the Node installation and run npm ci.`)
+    shutdown(1)
+  })
+  child.on('exit', (code, signal) => {
+    if (stopping) return
     // If either half dies the other is useless, so take the whole thing down
     // rather than leave a half-running app that looks alive but cannot answer.
-    console.log(`\x1b[${colour}m${name}\x1b[0m exited (${code}); stopping the rest.`)
-    shutdown(code ?? 0)
+    console.log(`\x1b[${colour}m${name}\x1b[0m exited (${signal ?? code}); stopping the rest.`)
+    shutdown(code ?? (signal ? 1 : 0))
   })
   children.push(child)
   return child
@@ -79,14 +78,20 @@ let stopping = false
 function shutdown(code) {
   if (stopping) return
   stopping = true
-  for (const c of children) {
+  const deadline = setTimeout(() => process.exit(code), 1500)
+  const stopped = children.map((child) => new Promise((resolve) => {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return resolve()
+    child.once('close', resolve)
     try {
-      c.kill('SIGTERM')
+      child.kill('SIGTERM')
     } catch {
-      /* already gone */
+      resolve()
     }
-  }
-  setTimeout(() => process.exit(code), 300)
+  }))
+  void Promise.all(stopped).then(() => {
+    clearTimeout(deadline)
+    process.exit(code)
+  })
 }
 
 process.on('SIGINT', () => shutdown(0))
@@ -111,15 +116,26 @@ if (port) {
   console.log(`  serving the face on port ${port}; the bridge will accept it.\n`)
 }
 
-vendorWasm()
+try {
+  assertSupportedNode()
+  const vite = join(ROOT, 'node_modules', 'vite', 'bin', 'vite.js')
+  const sdk = join(ROOT, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json')
+  if (!existsSync(vite) || !existsSync(sdk)) {
+    throw new Error('Dependencies are missing. Run npm ci in the repository and retry.')
+  }
+  vendorWasm()
 
-console.log('\nJ.A.R.V.I.S. starting — the brain and the face.\n')
-run('bridge', 'node', ['bridge/server.mjs'], '36', bridgeEnv)
-// npm is a shell script on most systems; call the vite binary directly so we do
-// not need shell:true (which would break the argument handling above).
-run('face', process.execPath, ['node_modules/vite/bin/vite.js'], '35', {})
+  console.log('\nJ.A.R.V.I.S. starting — the brain and the face.\n')
+  run('bridge', process.execPath, [join(ROOT, 'scripts', 'bridge.mjs')], '36', bridgeEnv)
+  // Launch JavaScript through the current Node executable, avoiding npm.cmd,
+  // PATH lookup, and shell quoting differences on Windows.
+  run('face', process.execPath, [vite], '35', {})
 
-console.log(
-  '\nWhen it says the dev server is ready, open the URL it prints in Chrome,\n' +
-    'click INITIALISE, and say "Hey Jarvis". Ctrl-C stops everything.\n',
-)
+  console.log(
+    '\nWhen it says the dev server is ready, open the URL it prints in Chrome,\n' +
+      'click INITIALISE, and say "Hey Jarvis". Ctrl-C stops everything.\n',
+  )
+} catch (err) {
+  console.error(`[jarvis] Startup failed: ${err.message}`)
+  shutdown(1)
+}

@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { NODE_REQUIREMENT, supportsNode } from './runtime.mjs';
 
 const tick = '  ok  ';
 const warn = ' note ';
@@ -25,20 +26,26 @@ console.log('------------------------------------------------------------');
 
 // --- Node version --------------------------------------------------------
 try {
-  const major = Number(process.versions.node.split('.')[0]);
-  if (Number.isFinite(major) && major >= 20) {
-    line(tick, `Node.js ${process.versions.node} (20+ required).`);
+  if (supportsNode()) {
+    line(tick, `Node.js ${process.versions.node} (${NODE_REQUIREMENT} required).`);
   } else {
-    line(warn, `Node.js ${process.versions.node} is below 20. Please upgrade — the bridge needs Node 20 or newer.`);
+    line(warn, `Node.js ${process.versions.node} is unsupported. Use ${NODE_REQUIREMENT}; Node 24 LTS is recommended.`);
   }
 } catch {
-  line(warn, 'Could not read the Node.js version. JARVIS needs Node 20 or newer.');
+  line(warn, `Could not read the Node.js version. JARVIS needs ${NODE_REQUIREMENT}.`);
 }
 
 // --- Claude CLI on PATH ---------------------------------------------------
 let claudeFound = false;
 try {
-  const res = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 10000 });
+  let res = spawnSync('claude', ['--version'], { encoding: 'utf8', timeout: 10000, windowsHide: true });
+  if (process.platform === 'win32' && ['ENOENT', 'EINVAL'].includes(res.error?.code)) {
+    // npm-installed CLI shims are .cmd files. Use a fixed command through cmd
+    // only for this advisory probe; the application launcher uses Node directly.
+    res = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', 'claude.cmd --version'], {
+      encoding: 'utf8', timeout: 10000, windowsHide: true,
+    });
+  }
   if (res.status === 0 && res.stdout) {
     claudeFound = true;
     line(tick, `Claude CLI found: ${res.stdout.trim()}`);

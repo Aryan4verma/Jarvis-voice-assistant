@@ -1,5 +1,10 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { prepareMediaPipe } from './scripts/assets.mjs'
+import { assertSupportedNode } from './scripts/runtime.mjs'
+
+assertSupportedNode()
+prepareMediaPipe()
 
 // https://vite.dev/config/
 export default defineConfig({
