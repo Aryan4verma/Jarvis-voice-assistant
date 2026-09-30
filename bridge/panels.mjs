@@ -340,7 +340,7 @@ export function displayServer(emit, emitBlade) {
         // the child element rather than the parent.
         const text = String(args.html ?? '').replace(/<[^>]*>/g, '').trim()
         if (!text && !/<(img|video|iframe|source)\b/i.test(args.html ?? '')) {
-          console.warn('[jarvis] display called with an empty body:', args.title)
+          console.warn('[jarvis] display called with an empty body')
           return {
             isError: true,
             content: [

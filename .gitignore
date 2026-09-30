@@ -40,6 +40,18 @@ public/mediapipe/
 /.claude/credentials.json
 /.claude/projects/
 /.claude/cache/
+/.jarvis-local/
+/runtime/
+/secrets/
+*.token
+*.secret
+credentials*.json
+cookies*.json
+cookies*.txt
+auth.json
+secrets.json
+!.env.*.example
+!.env.*.template
 
 # Personal memory, conversation exports, and SQLite sidecar files.
 *.db

@@ -106,7 +106,8 @@ missing or incomplete assets are repaired. Optional hand-model weights still
 need network access when not already cached.
 
 `npm run preview` serves the production frontend; start `npm run bridge` in a
-second terminal for AI requests. There is currently no automated test suite.
+second terminal for AI requests. Run `npm run test:security` for the focused
+bridge security suite; there is no full application end-to-end suite.
 Setup is advisory and does not establish Claude login or microphone/camera
 permissions. The existing Chrome native-host transport still assumes Unix
 sockets; Windows browser automation remains a later compatibility task.
@@ -132,7 +133,8 @@ Everything you see and hear happens in the browser. The bridge is a single Node
 process (`bridge/server.mjs`) that runs the **Claude Agent SDK**
 (`@anthropic-ai/claude-agent-sdk`) — this spawns the real `claude` CLI as a child
 process, so **the brain literally is Claude Code, headless.** They talk over a
-WebSocket (plus a few HTTP endpoints) on `ws://localhost:8787`.
+WebSocket (plus a few HTTP endpoints) on `127.0.0.1:8787`, reached through
+Vite's authenticated same-origin broker.
 
 **Why a bridge at all?** A browser tab cannot spawn the local stdio MCP servers —
 `higgsfield`, `elevenlabs`, `android`, `playwright`, `exa`, `serper`, and the
@@ -152,7 +154,7 @@ The loop is designed so that nothing silently dies and barge-in feels natural.
   fail, and is what makes **barge-in** work — speak while JARVIS is talking and he
   stops.
 - **Transcription has two tiers, chosen automatically at boot.** The browser asks
-  the bridge `/health` and picks the best available:
+  the authenticated bridge `/readiness` once and selects from its configuration:
   - **ElevenLabs key present** → ElevenLabs Scribe, via the bridge `/stt` endpoint.
   - **Nothing configured** → the browser's own `SpeechRecognition` (Chrome/Edge),
     guarded by a heartbeat so it recovers when Chrome throttles it.
@@ -163,8 +165,10 @@ The loop is designed so that nothing silently dies and barge-in feels natural.
 
 So it works with no keys and auto-upgrades when a key appears — there is no flag
 to set. Capability detection lives in `src/lib/capabilities.ts`, which probes the
-bridge's `GET /health` (returning `{ ok, tts, stt }`, both tracking the
-ElevenLabs key) once at boot and picks the engines.
+bridge's authenticated `GET /readiness` once at boot and picks the engines.
+Configured speech is not proof of a valid key or a working external service;
+the startup diagnostics label it `not-validated`. Public `/health` reports
+only basic bridge availability.
 
 ---
 
@@ -260,8 +264,8 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | `JARVIS_EFFORT` | `medium` | Reasoning effort |
 | `JARVIS_ALLOW_WRITES` | off | `1` allows effectful tools (see below) |
 | `JARVIS_ALLOWED_ORIGINS` | local dev | Extra WebSocket origins to accept |
-| `JARVIS_ALLOW_NO_ORIGIN` | off | Accept connections with no `Origin` header |
-| `JARVIS_FILE_ROOTS` | — | Roots the `/file` endpoint may serve from |
+| `JARVIS_ALLOW_NO_ORIGIN` | off | Accept authenticated WebSockets with no `Origin` header |
+| `JARVIS_FILE_ROOTS` | private artifacts | Extra narrow local artifact directories for `/file` |
 | `JARVIS_VOICE_ID` | — | ElevenLabs voice id |
 | `ELEVENLABS_API_KEY` | — | Optional; enables the ElevenLabs voice + Scribe |
 
@@ -270,7 +274,7 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 | Variable | Effect |
 |---|---|
 | `VITE_BACKEND` | `bridge` (default) or `direct` |
-| `VITE_BRIDGE_URL` | Where to reach the bridge |
+| `VITE_BRIDGE_URL` | Local bridge port used by the Node broker; remote hosts are refused |
 | `VITE_TTS_ENGINE` | `system` or `kokoro` |
 | `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
 | `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
@@ -284,8 +288,9 @@ You do not have to touch a flag. Either:
 - Add the key to your `elevenlabs` MCP server's env in `~/.claude.json` — the
   bridge reads it from there too.
 
-Either way, `/health` starts reporting the capability, the browser picks it up on
-the next boot, and both the voice and transcription upgrade automatically.
+Either way, authenticated `/readiness` reports speech as configured, the browser
+picks it up on the next boot, and both voice and transcription are selected
+automatically. External service access is validated by actual use.
 
 ---
 
@@ -295,8 +300,10 @@ The tool gate starts **read-only**. Search, generation and lookups run freely;
 anything effectful — send, tap, delete, install, pay — is denied. Voice is a poor
 interface for a confirmation dialog, so the decision is made ahead of time in
 `decideTool()` in `bridge/server.mjs`, not at the moment of use. The bridge sets
-`settingSources: []`, which makes its own gate the only authority — filesystem
-settings and any global `bypassPermissions` cannot override it.
+`settingSources: []`, so filesystem settings and global allow-rules are not
+loaded. This callback is not a complete
+tool sandbox: SDK auto-approved tools can bypass it. A stronger tool-permission
+architecture is a later phase.
 
 To allow effectful tools (phone, browser driving, sending), run the bridge this
 way instead:
@@ -324,16 +331,56 @@ terminal, and that nothing else is holding port `8787`.
 
 ---
 
-## Security
+## Local bridge security
 
-All of this lives in `bridge/server.mjs`:
+The bridge binds explicitly to `127.0.0.1`. Both HTTP and WebSocket requests
+validate the local Host, and sensitive requests require a randomly generated
+bearer credential. `/health` is intentionally public and returns only
+`{"ok":true}`; authenticated `/readiness` distinguishes configuration from actual
+validation. It performs no periodic cloud checks or authentication probe.
 
-- The WebSocket accepts only local dev origins (add more with
-  `JARVIS_ALLOWED_ORIGINS`).
-- `/file`, `/img` and `/media` validate the scheme, confine to allowed roots,
-  resolve the real path, and refuse private and loopback addresses (SSRF guard).
-- The tool gate (`decideTool`) is default-deny for effectful MCP tools.
-- A strict CSP in `index.html`; model-authored panel HTML is sanitised.
+Vite's local dev/preview broker initializes an HttpOnly, SameSite=Strict,
+origin-bound browser session through a same-origin POST. It keeps the bridge
+bearer on the Node side and forwards authenticated, streaming requests. The
+bearer is never included in frontend bundles, URLs, localStorage, or logs.
+Browser session cookies contain a derived credential, not the bridge bearer.
+The browser must use this local dev/preview workflow in bridge mode; serving
+the built frontend on an unrelated static host is not supported in bridge mode.
+`VITE_BRIDGE_URL` can select a local bridge port, not a remote bridge host.
+
+Private runtime records live beneath `%LOCALAPPDATA%\JarvisAI\bridge\<checkout-id>`
+on Windows, or `~/.local/share/JarvisAI/bridge/<checkout-id>` elsewhere. Each
+bridge port has a per-process credential, rotated at restart; stale records
+with a dead PID are refused. File permissions use the private user-profile
+directory and restrictive POSIX modes where supported. This protects against
+LAN access and unrelated websites, not malware/admin processes running with
+access to the same user's files/browser. Keep user-profile ACLs private.
+
+`/file`, `/img`, `/media`, `/page`, `/tts`, `/stt`, `/readiness`, and WebSocket
+`/`/`/ws` require authentication. Sandboxed reader images use ten-minute grants
+bound to one `/img` URL; these grant no file, speech, or agent access. Referrers
+are suppressed. URL schemes, private/loopback addresses, DNS rebinding,
+redirects, size limits, DOMPurify, and realpath checks remain guarded.
+
+Local images must be in the private runtime `artifacts` subfolder, or an existing
+narrow directory explicitly listed in the bridge shell's `JARVIS_FILE_ROOTS`.
+Home, temp, and drive roots are no longer approved. UNC/device paths are refused
+before filesystem access. Tools that produce images elsewhere must be configured
+to use an approved output directory, or that specific folder must be approved.
+Do not place credentials or unrelated personal images in these directories.
+
+Default limits are one agent/WebSocket session, eight authenticated HTTP requests,
+six proxies/file reads, one STT request, and two TTS requests at a time, plus a
+120-request/minute budget. `JARVIS_MAX_SESSIONS`, `JARVIS_MAX_HTTP`,
+`JARVIS_MAX_PROXIES`, `JARVIS_MAX_STT`, `JARVIS_MAX_TTS`, and
+`JARVIS_REQUESTS_PER_MINUTE` adjust them within bounded ranges. Excess work gets
+429; WebSocket payloads and input queues are capped. Speech calls have deadlines.
+Multiple tabs share this budget; raise the session limit deliberately if needed.
+
+Logs retain operation/status information but omit raw URLs, credentials, upstream
+error bodies, transcripts, and tool inputs. Run `npm run test:security` to check
+the real local HTTP/WS transport and frontend broker using a test-only SDK double;
+the suite does not contact a model or write personal conversation transcripts.
 
 ---
 

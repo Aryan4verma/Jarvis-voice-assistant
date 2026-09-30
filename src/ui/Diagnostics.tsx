@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
+import { bridgeReadiness } from '../lib/capabilities'
 
 /**
  * The "why can't he hear me / why can't I hear him" panel.
@@ -84,6 +85,7 @@ export function Diagnostics() {
   const w = window as unknown as Record<string, unknown>
   const v = (w.__voice ?? {}) as Partial<VoiceDiag>
   const t = (w.__tts ?? {}) as Partial<TtsDiag>
+  const bridge = bridgeReadiness()
 
   // The two verdicts worth stating outright, rather than making you infer them
   // from the numbers underneath.
@@ -103,6 +105,11 @@ export function Diagnostics() {
         </span>
       </div>
 
+      <div className="diag-sec">BRIDGE · STARTUP SNAPSHOT</div>
+      <Row k="availability" v={bridge?.ok ? 'authenticated' : 'not checked / unavailable'} />
+      <Row k="AI" v={bridge ? `${bridge.ai.configuration} · ${bridge.ai.readiness}` : 'unknown'} />
+      <Row k="speech" v={bridge ? `${bridge.speech.stt} · ${bridge.speech.readiness}` : 'unknown'} />
+      <Row k="browser / MCP" v={bridge ? `${bridge.browser} / ${bridge.mcp}` : 'unknown'} />
       <div className="diag-sec">LISTENING</div>
       <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />
       <Row k="sessions" v={String(v.sessions ?? 0)} />

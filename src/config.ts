@@ -66,13 +66,11 @@ export const BACKEND: 'bridge' | 'direct' = choice(
 )
 
 /**
- * Where the bridge lives. Derived once here rather than in each of the three
- * places that talk to it, so moving off the default port is a single edit.
- * `wss://` maps to `https://` on its own, which is why this is a prefix swap
- * rather than a hardcoded scheme.
+ * Same-origin Vite broker. VITE_BRIDGE_URL / JARVIS_BRIDGE_PORT configure the
+ * broker on the Node side; the bridge bearer never enters frontend code.
  */
-export const BRIDGE_WS_URL = str(import.meta.env.VITE_BRIDGE_URL) ?? 'ws://localhost:8787'
-export const BRIDGE_HTTP_URL = BRIDGE_WS_URL.replace(/^ws/, 'http')
+export const BRIDGE_HTTP_URL = '/__jarvis/bridge'
+export const BRIDGE_WS_URL = new URL(`${BRIDGE_HTTP_URL}/ws`, window.location.href).href.replace(/^http/, 'ws')
 
 /**
  * Speech output engine.

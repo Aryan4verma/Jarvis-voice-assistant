@@ -1,5 +1,6 @@
 import DOMPurify from 'dompurify'
 import { BRIDGE_HTTP_URL } from '../config'
+import { localBridgeFileUrl, localImagePath } from '../lib/localImagePath'
 
 /**
  * The safety boundary for model-authored markup.
@@ -12,14 +13,6 @@ import { BRIDGE_HTTP_URL } from '../config'
  * The markup is treated as untrusted, and it genuinely is: it is written by a
  * model that has, moments earlier, been reading pages off the open web.
  */
-
-/**
- * Paths that are genuinely on this machine's disk, as opposed to app-relative
- * URLs that happen to start with a slash. `/vite.svg` is one of our own static
- * assets; `/Users/you/shot.png` is a screenshot JARVIS just took.
- */
-const DISK_PATH =
-  /^\/(Users|home|root|Volumes|Applications|System|Library|private|tmp|var|opt|mnt|media|srv|data)\//
 
 /**
  * Every media URL is rewritten to point at the bridge. Two destinations, for
@@ -44,9 +37,11 @@ const DISK_PATH =
 function rewriteSrc(el: Element, attr: 'src' | 'poster', route: 'img' | 'media') {
   const raw = el.getAttribute(attr) ?? ''
   if (!raw) return
+  const local = localBridgeFileUrl(raw)
+  if (local) { el.setAttribute(attr, local); return }
 
-  const path = raw.replace(/^file:\/\//, '')
-  if (DISK_PATH.test(path)) {
+  const path = localImagePath(raw)
+  if (path) {
     el.setAttribute(attr, `${BRIDGE_HTTP_URL}/file?path=${encodeURIComponent(path)}`)
     return
   }

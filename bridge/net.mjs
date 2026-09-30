@@ -158,6 +158,7 @@ export function vetTarget(raw) {
     throw proxyError(400, 'absolute http(s) url required')
   }
   if (!url.hostname) throw proxyError(400, 'absolute http(s) url required')
+  if (url.username || url.password) throw proxyError(400, 'credentials in URLs are not permitted')
   if (BLOCKED_HOSTNAME.test(url.hostname)) throw proxyError(403, 'blocked host')
   // An IP literal never reaches DNS in any meaningful sense, so judge it here —
   // this is what turns http://127.0.0.1:8787/health into a refusal before a
@@ -213,14 +214,16 @@ export function requestOnce(url, headers, timeoutMs) {
  * http://169.254.169.254/ is the whole SSRF attack, and a redirect to
  * file:// or data: is the other half of it.
  */
-export async function openRemote(startUrl, headers, timeoutMs) {
+export async function openRemote(startUrl, headers, timeoutMs, request = requestOnce) {
   let url = startUrl
   for (let hop = 0; ; hop++) {
-    const res = await requestOnce(url, headers, timeoutMs)
+    const res = await request(url, headers, timeoutMs)
     const status = res.statusCode ?? 0
     const location = res.headers.location
     if (status >= 300 && status < 400 && location) {
-      res.resume() // drain, or the socket never returns to the pool
+      // Abandon redirect bodies instead of downloading arbitrary bytes after
+      // this hop has finished counting toward the authenticated request limit.
+      res.destroy()
       if (hop >= MAX_REDIRECTS) throw proxyError(502, 'too many redirects')
       let next
       try {
@@ -265,7 +268,7 @@ export async function fetchText(url, { maxBytes, timeoutMs, accept }) {
     .toLowerCase()
 
   if (status !== 200) {
-    res.resume()
+    res.destroy()
     throw proxyError(status === 404 ? 404 : 502, `upstream said ${status}`)
   }
 

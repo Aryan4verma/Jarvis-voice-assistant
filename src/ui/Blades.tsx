@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useStore, type Blade } from '../store'
 import { BRIDGE_HTTP_URL } from '../config'
+import { localBridgeFileUrl, localImagePath } from '../lib/localImagePath'
 import { sanitisePanelHtml } from './sanitise'
 import { frameSpan, peaceScroll, pinchCount } from '../lib/hands'
 import * as camera from '../lib/camera'
@@ -36,22 +37,15 @@ import * as camera from '../lib/camera'
 
 /* ------------------------------------------------------------------ sources */
 
-/**
- * Paths that are genuinely on this machine's disk, as opposed to app-relative
- * URLs that happen to start with a slash. Mirrors the test in sanitise.ts and
- * Orbits.tsx — the list of root directories is the sort of thing that should be
- * changed in each place deliberately.
- */
-const DISK_PATH =
-  /^\/(Users|home|root|Volumes|Applications|System|Library|private|tmp|var|opt|mnt|media|srv|data)\//
-
 /** Route a source through the bridge, which is the only origin that can
  *  actually fetch it — and the only one the page CSP will load from. */
 function viaBridge(raw: string, route: 'img' | 'media'): string {
   const src = String(raw ?? '').trim()
   if (!src) return ''
-  const path = src.replace(/^file:\/\//, '')
-  if (DISK_PATH.test(path)) {
+  const local = localBridgeFileUrl(src)
+  if (local) return local
+  const path = localImagePath(src)
+  if (path) {
     return `${BRIDGE_HTTP_URL}/file?path=${encodeURIComponent(path)}`
   }
   if (!/^https?:\/\//i.test(src)) return src

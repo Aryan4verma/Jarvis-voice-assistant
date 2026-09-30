@@ -1,4 +1,5 @@
 import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
+import { bridgeFetch } from './bridgeSession'
 
 /**
  * What speech engines are actually available, decided once at boot.
@@ -18,15 +19,24 @@ import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
  */
 
 export type Capabilities = {
-  /** ElevenLabs speech-to-text (Scribe) is reachable via the bridge. */
+  /** Bridge has STT configuration; the external service is not probed. */
   stt: boolean
-  /** ElevenLabs text-to-speech is reachable via the bridge. */
+  /** Bridge has TTS configuration; runtime failures use the existing fallback. */
   tts: boolean
 }
 
 /** Browser-only until the probe says otherwise. Safe default: the app works. */
 let current: Capabilities = { stt: false, tts: false }
 let probed = false
+export type Readiness = {
+  ok: boolean
+  ai: { configuration: string; readiness: string }
+  speech: { stt: string; tts: string; readiness: string }
+  browser: string
+  mcp: string
+}
+let status: Readiness | null = null
+export const bridgeReadiness = () => status
 
 /** The last known capabilities. Read synchronously by the voice and speech
  *  layers; accurate once `probeCapabilities` has resolved during boot. */
@@ -52,12 +62,12 @@ export async function probeCapabilities(): Promise<Capabilities> {
     return current
   }
   try {
-    const res = await fetch(`${BRIDGE_HTTP_URL}/health`, {
+    const res = await bridgeFetch(`${BRIDGE_HTTP_URL}/readiness`, {
       signal: AbortSignal.timeout(3000),
     })
     if (res.ok) {
-      const h = (await res.json()) as { stt?: boolean; tts?: boolean }
-      current = { stt: Boolean(h.stt), tts: Boolean(h.tts) }
+      status = (await res.json()) as Readiness
+      current = { stt: status.speech.stt === 'configured', tts: status.speech.tts === 'configured' }
     }
   } catch {
     // Bridge down or slow — stay on the browser engines rather than blocking
