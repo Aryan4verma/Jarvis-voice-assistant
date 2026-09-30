@@ -16,11 +16,13 @@
  */
 
 import { WebSocketServer } from 'ws'
+import { once } from 'node:events'
 import { query } from '@anthropic-ai/claude-agent-sdk'
 import { displayServer } from './panels.mjs'
 import { uiServer } from './ui.mjs'
 import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer } from './vision.mjs'
+import { createTurnScope } from './turn.mjs'
 import { homedir } from 'node:os'
 import { readFileSync } from 'node:fs'
 import { readFile, stat } from 'node:fs/promises'
@@ -652,6 +654,7 @@ function corsFor(req) {
 
 // One HTTP server for both the speech proxy and the WebSocket upgrade.
 const http = await import('node:http')
+const httpRequests = new Set()
 
 const handleRequest = async (req, res) => {
   if (!localHostAllowed(req.headers.host, PORT)) {
@@ -690,7 +693,9 @@ const handleRequest = async (req, res) => {
     res.writeHead(429, { ...cors, 'retry-after': '2' })
     return res.end('bridge busy; retry shortly')
   }
-  const release = () => { releaseHttp(); releaseKind() }
+  const requestAbort = new AbortController()
+  httpRequests.add(requestAbort)
+  const release = () => { httpRequests.delete(requestAbort); requestAbort.abort(); releaseHttp(); releaseKind() }
   res.once('finish', release)
   res.once('close', release)
   const bodyCap = route === '/stt' ? 25 * 1024 * 1024 : 64 * 1024
@@ -869,7 +874,7 @@ const handleRequest = async (req, res) => {
           `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
         {
           method: 'POST',
-          signal: AbortSignal.timeout(30000),
+          signal: AbortSignal.any([requestAbort.signal, AbortSignal.timeout(30000)]),
           headers: { 'xi-api-key': key, 'content-type': 'application/json' },
           body: JSON.stringify({
             text,
@@ -896,7 +901,10 @@ const handleRequest = async (req, res) => {
         'content-type': 'audio/mpeg',
         'cache-control': 'no-cache',
       })
-      for await (const chunk of upstream.body) res.write(Buffer.from(chunk))
+      for await (const chunk of upstream.body) {
+        requestAbort.signal.throwIfAborted()
+        if (!res.write(Buffer.from(chunk))) await once(res, 'drain', { signal: requestAbort.signal })
+      }
       return res.end()
     } catch (err) {
       console.warn('[jarvis] speech request failed:', errorLabel(err))
@@ -967,7 +975,7 @@ const handleRequest = async (req, res) => {
 
       const upstream = await fetch('https://api.elevenlabs.io/v1/speech-to-text', {
         method: 'POST',
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.any([requestAbort.signal, AbortSignal.timeout(30000)]),
         headers: { 'xi-api-key': key },
         body: form,
       })
@@ -1073,259 +1081,171 @@ const RESULT_FAILURES = {
   default: 'The turn ended without an answer.',
 }
 
+// One immutable query scope per interaction. Resume preserves conversation
+// context without reusing callbacks that could relabel a cancelled turn.
+const connections = new Set()
 wss.on('connection', (socket) => {
   socket.on('error', (err) => console.warn('[jarvis] websocket failed:', errorLabel(err)))
   console.log('[jarvis] client connected')
-
-  // Answer the HUD straight away rather than making it wait for the agent's
-  // first turn. Refined later by the real init message.
-  socket.send(
-    JSON.stringify({ type: 'ready', servers: Object.keys(MCP_SERVERS) }),
-  )
-
-  /** Resolves the pending user message into the SDK's input generator. */
-  let deliver = null
-  let closed = false
-  const inbox = []
-  let queued = 0
-  const messageAllowed = createRateLimit(240)
-  const askAllowed = createRateLimit(20)
-
-  async function* userMessages() {
-    while (!closed) {
-      const text =
-        inbox.shift() ??
-        (await new Promise((resolve) => {
-          deliver = resolve
-        }))
-      if (closed || text == null) return
-      queued = Math.max(0, queued - 1)
-      yield {
-        type: 'user',
-        message: { role: 'user', content: text },
-        parent_tool_use_id: null,
-      }
+  const send = (message) => { if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message)) }
+  send({ scope: 'connection', type: 'ready', servers: Object.keys(MCP_SERVERS) })
+  let active = null, resumeId = null, closed = false
+  const recentIds = new Set()
+  const messageAllowed = createRateLimit(240), askAllowed = createRateLimit(20)
+  const cancel = (turn, reason) => {
+    if (!turn || !turn.scope.live()) return
+    // Quarantine first, before invoking SDK hooks that may emit final events.
+    turn.scope.stop()
+    turn.controller.abort()
+    let backend = 'not-started'
+    if (turn.session) {
+      try { turn.session.close(); backend = 'termination-requested' }
+      catch { backend = 'termination-unconfirmed' }
     }
+    send({ scope: 'turn', type: 'cancelled', turnId: turn.scope.turnId, reason, backend })
+    if (active === turn) active = null
   }
-
-  const send = (msg) => {
-    if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(msg))
+  const disconnect = () => {
+    closed = true
+    cancel(active, 'disconnect')
+    recentIds.clear()
+    connections.delete(disconnect)
+    if (wss.clients.size === 0) mcpState = 'not-loaded'
   }
+  connections.add(disconnect)
+  socket.on('close', disconnect)
 
-  /**
-   * Which question the agent is currently answering.
-   *
-   * The stream carries no notion of a turn, so without this the client cannot
-   * tell the tail of an abandoned answer from the start of the new one — it
-   * attaches a listener and receives whatever is on the socket. Echoing the
-   * id the client sent lets it ignore anything that is not its own, which is
-   * the only reliable fix: no amount of waiting on this side changes what a
-   * listener over there has already heard.
-   */
-  let answering = null
-  const sendTurn = (msg) => send({ ...msg, ask: answering })
+  async function run(turn, text) {
+    const scope = turn.scope
+    const resume = resumeId
+    const seenTools = new Set(), heldTools = new Map()
+    let terminal = false
+    scope.signal.addEventListener('abort', () => { seenTools.clear(); heldTools.clear() }, { once: true })
+    const announceTool = (id, name) => {
+      if (!name || (id && seenTools.has(id))) return
+      if (!scope.live()) return
+      if (id && seenTools.size < 256) seenTools.add(id)
+      // The display tool isn't work being done, it's the HUD drawing itself —
+      // announcing it would put "jarvis · display" in the tool badge and trigger
+      // a "working on it" filler for something already on screen.
+      if (name === 'mcp__jarvis__display') return
+      // The ui_* tools are the same case one step further: retinting the
+      // interface is the interface talking about itself, not work being done for
+      // the user, and the badge would be describing the very thing they can see.
+      if (name.startsWith('mcp__jarvis_ui__')) return
+      if (decideTool(name)) return scope.send({ type: 'tool', name })
+      if (id && heldTools.size < 256) heldTools.set(id, name)
+    }
 
-  /**
-   * Asking the browser for something and waiting for the answer.
-   *
-   * Every other tool here pushes — a panel, a blade, a retint — and never needs
-   * a reply. The camera is the exception: the hardware is over there and the
-   * model is here, so a frame has to come back. Correlated by id because a turn
-   * can have more than one request in flight, and timed out because a browser
-   * that has been closed mid-question would otherwise hang the turn until the
-   * two-minute idle timer noticed.
-   */
-  const waiting = new Map()
-  let asks = 0
+    const settleTool = (id, failed) => {
+      const name = heldTools.get(id)
+      if (name === undefined) return
+      heldTools.delete(id)
+      if (!failed) scope.send({ type: 'tool', name })
+    }
 
-  const ask = (kind, args, timeoutMs = 20_000) =>
-    new Promise((resolve, reject) => {
-      if (socket.readyState !== socket.OPEN) {
-        return reject(new Error('the interface is not connected'))
-      }
-      const id = `q${++asks}`
-      const timer = setTimeout(() => {
-        waiting.delete(id)
-        reject(new Error('the interface did not answer in time'))
-      }, timeoutMs)
-      waiting.set(id, { resolve, timer })
-      send({ type: kind, id, ...args })
-    })
 
-  /**
-   * Announcing a tool on the HUD, once, and only if it actually runs.
-   *
-   * A tool_use block surfaces twice — as a partial stream event and again on
-   * the completed assistant message — so ids are remembered. The harder part
-   * is timing, because a refused tool that lights the badge, plays the sound
-   * and provokes a "working on it" line, for work that never happens, reads as
-   * a bug on camera.
-   *
-   * The SDK's order is: the block starts streaming, then canUseTool is asked,
-   * then the tool runs. So nothing is known at content_block_start. Announcing
-   * from inside canUseTool would know the verdict but miss tools entirely —
-   * measured on this SDK, the callback is consulted only for calls the CLI
-   * hasn't already settled, so a `Bash: echo` its own classifier waves through
-   * never reaches us at all.
-   *
-   * So: announce immediately for anything decideTool permits, since those run.
-   * Hold the rest, and let the tool_result settle it — a refusal comes back as
-   * is_error, anything else really did execute and has earned its badge, a
-   * beat late. Nothing is ever announced for work that didn't happen.
-   */
-  const seenTools = new Set()
-  const heldTools = new Map()
-
-  /**
-   * Resolves when the turn in flight has actually finished.
-   *
-   * Waiting on session.interrupt() alone is not enough. It resolves when the
-   * agent has been *told* to stop, not when it has, so the last tokens of the
-   * abandoned answer are still on their way — and since nothing on the wire
-   * identifies which question a delta belongs to, they land on the next turn's
-   * listener. Measured: ask for ALPHA, interrupt, ask for BRAVO, and BRAVO's
-   * answer arrives as "ALPHA\nBRAVO".
-   *
-   * The SDK emits exactly one `result` per turn, so that is the boundary worth
-   * waiting for. Raced against a timeout because a turn that never reports one
-   * must not wedge the conversation for ever — a stray word is a blemish, a
-   * deadlocked assistant is not.
-   */
-  let settling = Promise.resolve()
-  let finishTurn = null
-
-  const turnFinished = () =>
-    new Promise((resolve) => {
-      finishTurn = resolve
-    })
-
-  /**
-   * A brief pause so the abandoned turn's frames are tagged with the OLD id
-   * before the new one is adopted. Short, because correctness now comes from
-   * the tag rather than from the wait — this only has to cover the gap, not
-   * outlast the whole turn.
-   */
-  const SETTLE_CAP_MS = 400
-
-  const announceTool = (id, name) => {
-    if (!name || (id && seenTools.has(id))) return
-    if (id) seenTools.add(id)
-    // The display tool isn't work being done, it's the HUD drawing itself —
-    // announcing it would put "jarvis · display" in the tool badge and trigger
-    // a "working on it" filler for something already on screen.
-    if (name === 'mcp__jarvis__display') return
-    // The ui_* tools are the same case one step further: retinting the
-    // interface is the interface talking about itself, not work being done for
-    // the user, and the badge would be describing the very thing they can see.
-    if (name.startsWith('mcp__jarvis_ui__')) return
-    if (decideTool(name)) return sendTurn({ type: 'tool', name })
-    if (id) heldTools.set(id, name)
-  }
-
-  const settleTool = (id, failed) => {
-    const name = heldTools.get(id)
-    if (name === undefined) return
-    heldTools.delete(id)
-    if (!failed) sendTurn({ type: 'tool', name })
-  }
-
-  const session = query({
-    prompt: userMessages(),
-    options: {
-      // Everything Claude Code has configured, plus the HUD as an in-process
-      // server. The HUD's handler closes over this socket, so a `display` call
-      // lands on screen directly — which is also why this object is built per
-      // connection rather than once.
-      mcpServers: {
-        ...MCP_SERVERS,
-        jarvis: displayServer(
-          (panel) => send({ type: 'panel', panel }),
-          (blade) => send({ type: 'blade', blade }),
-        ),
-        // The interface controls, on the same socket. A separate key because
-        // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
-        // one server; the underscore in it is why decideTool and announceTool
-        // both name `jarvis_ui` explicitly.
-        jarvis_ui: uiServer((op, args) => send({ type: 'ui', op, args })),
-        // The user's own Chrome, over the extension's native-host socket. It
-        // holds no per-connection state, but it is built here with the rest so
-        // the write gate is read once, at the same point as everything else.
-        jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES }),
-        // The camera, which unlike everything else here has to ask and wait.
-        jarvis_eyes: visionServer(ask),
-      },
-      // A plain system prompt, not the claude_code preset. The preset is
-      // tuned for a coding agent — verbose, file-oriented, and a large chunk
-      // of input tokens on every turn. Replacing it makes the persona stick,
-      // keeps answers short enough to speak, and cuts cost per turn.
-      systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
-      // Run from the home directory so project-scoped MCP servers don't shadow
-      // the global ones, and so file tools have a sane root.
-      cwd: homedir(),
-      // No filesystem settings at all. Left to its default the SDK loads
-      // ~/.claude/settings.json and settings.local.json exactly as the CLI
-      // does — which on a working machine means a bypassPermissions default
-      // and a pile of allow-rules for Bash. Allow-rules are matched before the
-      // permission callback, so decideTool below would never even be asked
-      // about the tools it most needs to refuse. Empty makes this bridge the
-      // only authority. It also stops the global CLAUDE.md riding along on
-      // every voice turn, carrying instructions written for a coding agent
-      // into a conversation that is meant to be two sentences long.
-      //
-      // The cost is that MCP servers stop being discovered too, which is why
-      // mcpServers above passes them in by hand.
-      settingSources: [],
-      // Stated explicitly, and it has to be.
-      //
-      // With no `model` here the SDK falls back to its own default, which on
-      // this machine resolved to claude-opus-4-8[1m] — not what src/config.ts
-      // declares for the browser-direct path, and not anything anyone chose.
-      // Normally your own `/model` preference would decide, but that lives in
-      // the settings files `settingSources: []` deliberately stops loading, so
-      // without this line nothing in the project has a say at all.
-      model: MODEL,
-      effort: EFFORT,
-      maxTurns: 24,
-      permissionMode: 'default',
-      // Without this the SDK only emits whole assistant messages, and JARVIS
-      // would sit silent until the entire answer was written. Partial events
-      // are what let speech start on the first finished sentence.
-      includePartialMessages: true,
-      // Signature is (toolName, input, options) and it must return a
-      // PermissionResult object. Returning a bare boolean silently denies
-      // everything, with the tool name arriving undefined.
-      //
-      // Worth knowing: this is a last gate, not the only one. Calls the CLI
-      // has already settled never arrive here — its own classifier waves
-      // through a `Bash: echo hello` without asking, and only reaches us for
-      // something with a consequence, like a `touch`. So a deny here is
-      // reliable; an absence of a call here is not proof nothing ran.
-      canUseTool: async (toolName) => {
-        const ok = decideTool(toolName)
-        console.log(`[jarvis] tool decision: ${ok ? 'allow' : 'deny'}`)
-        return ok
-          ? { behavior: 'allow' }
-          : {
-              behavior: 'deny',
-              // Every word of this can end up spoken, so it carries no command
-              // to read out — the persona is forbidden from saying one aloud.
-              message:
-                'Blocked: JARVIS is running in read-only mode and cannot take' +
-                ' actions that change anything. Tell the user this action is' +
-                ' unavailable until they enable write access on the machine.',
-            }
-      },
-    },
-  })
-
-  // Pump the session's output stream to the browser for as long as it lives.
-  ;(async () => {
     try {
-      for await (const msg of session) {
-        if (process.env.JARVIS_DEBUG === '1') {
-          console.log('[msg]', msg.type, msg.event?.type ?? '')
-        }
+      if (!scope.live() || closed) return
+      async function* messages() {
+        yield { type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null, ...(resume ? { session_id: resume } : {}) }
+      }
+      const session = query({
+        prompt: messages(),
+        options: {
+          abortController: turn.controller,
+          ...(resume ? { resume } : {}),
+          // Everything Claude Code has configured, plus the HUD as an in-process
+          // server. The HUD's handler closes over this socket, so a `display` call
+          // lands on screen directly — which is also why this object is built per
+          // turn rather than once.
+          mcpServers: {
+            ...MCP_SERVERS,
+            jarvis: displayServer(
+              (panel) => scope.send({ type: 'panel', panel }),
+              (blade) => scope.send({ type: 'blade', blade }),
+            ),
+            // The interface controls, on the same socket. A separate key because
+            // MCP tool names are `mcp__<key>__<tool>` and one key can only carry
+            // one server; the underscore in it is why decideTool and announceTool
+            // both name `jarvis_ui` explicitly.
+            jarvis_ui: uiServer((op, args) => scope.send({ type: 'ui', op, args })),
+            // The user's own Chrome, over the extension's native-host socket. It
+            // holds no per-connection state, but it is built here with the rest so
+            // the write gate is read once, at the same point as everything else.
+            jarvis_chrome: chromeServer({ allowWrites: ALLOW_WRITES, signal: scope.signal }),
+            // The camera, which unlike everything else here has to ask and wait.
+            jarvis_eyes: visionServer(scope.request),
+          },
+          // A plain system prompt, not the claude_code preset. The preset is
+          // tuned for a coding agent — verbose, file-oriented, and a large chunk
+          // of input tokens on every turn. Replacing it makes the persona stick,
+          // keeps answers short enough to speak, and cuts cost per turn.
+          systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
+          // Run from the home directory so project-scoped MCP servers don't shadow
+          // the global ones, and so file tools have a sane root.
+          cwd: homedir(),
+          // No filesystem settings at all. Left to its default the SDK loads
+          // ~/.claude/settings.json and settings.local.json exactly as the CLI
+          // does — which on a working machine means a bypassPermissions default
+          // and a pile of allow-rules for Bash. Allow-rules are matched before the
+          // permission callback, so decideTool below would never even be asked
+          // about the tools it most needs to refuse. The callback remains a
+          // last gate, not a complete tool sandbox. It also stops the global
+          // CLAUDE.md riding along on
+          // every voice turn, carrying instructions written for a coding agent
+          // into a conversation that is meant to be two sentences long.
+          //
+          // The cost is that MCP servers stop being discovered too, which is why
+          // mcpServers above passes them in by hand.
+          settingSources: [],
+          // Stated explicitly, and it has to be.
+          //
+          // With no `model` here the SDK falls back to its own default, which on
+          // this machine resolved to claude-opus-4-8[1m] — not what src/config.ts
+          // declares for the browser-direct path, and not anything anyone chose.
+          // Normally your own `/model` preference would decide, but that lives in
+          // the settings files `settingSources: []` deliberately stops loading, so
+          // without this line nothing in the project has a say at all.
+          model: MODEL,
+          effort: EFFORT,
+          maxTurns: 24,
+          permissionMode: 'default',
+          // Without this the SDK only emits whole assistant messages, and JARVIS
+          // would sit silent until the entire answer was written. Partial events
+          // are what let speech start on the first finished sentence.
+          includePartialMessages: true,
+          // Signature is (toolName, input, options) and it must return a
+          // PermissionResult object. Returning a bare boolean silently denies
+          // everything, with the tool name arriving undefined.
+          //
+          // Worth knowing: this is a last gate, not the only one. Calls the CLI
+          // has already settled never arrive here — its own classifier waves
+          // through a `Bash: echo hello` without asking, and only reaches us for
+          // something with a consequence, like a `touch`. So a deny here is
+          // reliable; an absence of a call here is not proof nothing ran.
+          canUseTool: async (toolName) => {
+            const ok = scope.live() && decideTool(toolName)
+            console.log(`[jarvis] tool decision: ${ok ? 'allow' : 'deny'}`)
+            return ok
+              ? { behavior: 'allow' }
+              : {
+                  behavior: 'deny',
+                  // Every word of this can end up spoken, so it carries no command
+                  // to read out — the persona is forbidden from saying one aloud.
+                  message:
+                    'Blocked: JARVIS is running in read-only mode and cannot take' +
+                    ' actions that change anything. Tell the user this action is' +
+                    ' unavailable until they enable write access on the machine.',
+                }
+          },
+        },
+      })
 
+      turn.session = session
+      for await (const msg of session) {
+        if (!scope.live() || closed) continue
+        if (process.env.JARVIS_DEBUG === '1') console.log('[msg]', msg.type, msg.event?.type ?? '')
         switch (msg.type) {
           // Raw Anthropic stream events, surfaced by includePartialMessages.
           // This is the ONLY place spoken text arrives: there is no top-level
@@ -1339,7 +1259,7 @@ wss.on('connection', (socket) => {
               ev.delta?.type === 'text_delta' &&
               ev.delta.text
             ) {
-              sendTurn({ type: 'text', delta: ev.delta.text })
+              scope.send({ type: 'text', delta: ev.delta.text })
             }
             if (
               ev?.type === 'content_block_start' &&
@@ -1382,7 +1302,7 @@ wss.on('connection', (socket) => {
             // nothing to say — the HUD stops spinning and JARVIS stands there
             // silent. Say what happened instead.
             if (msg.subtype === 'success') {
-              sendTurn({
+              scope.send({
                 type: 'done',
                 text: msg.result ?? '',
                 costUsd: msg.total_cost_usd ?? null,
@@ -1391,17 +1311,16 @@ wss.on('connection', (socket) => {
               console.error(
                 `[jarvis] turn failed: ${Object.hasOwn(RESULT_FAILURES, msg.subtype) ? msg.subtype : 'unknown result'}`,
               )
-              sendTurn({
+              scope.send({
                 type: 'error',
                 message: RESULT_FAILURES[msg.subtype] ?? RESULT_FAILURES.default,
               })
             }
             // Whatever was waiting on this turn to finish can go now. This is
             // the only place a turn is genuinely over.
-            finishTurn?.()
-            finishTurn = null
-            // One turn's tool ids are never referred to again, and these
-            // otherwise grow for as long as the socket is open.
+            if (msg.subtype === 'success' && typeof msg.session_id === 'string') resumeId = msg.session_id
+            terminal = true
+            scope.stop()
             seenTools.clear()
             heldTools.clear()
             break
@@ -1413,97 +1332,65 @@ wss.on('connection', (socket) => {
               const usable = (msg.mcp_servers ?? [])
                 .filter((s) => s.status !== 'needs-auth' && s.status !== 'failed')
                 .map((s) => s.name)
-              send({ type: 'ready', servers: usable })
+              send({ scope: 'connection', type: 'ready', servers: usable })
               mcpState = 'loaded; status supplied by agent'
               console.log(`[jarvis] ${usable.length} MCP servers available`)
             }
             break
         }
+        if (terminal) break
       }
+      if (scope.live() && !terminal && !closed) scope.send({ type: 'error', message: 'The agent stream ended without a result.' })
     } catch (err) {
-      console.error('[jarvis] session error:', errorLabel(err))
-      send({ type: 'error', message: 'The agent session failed. Check Claude authentication and local configuration.' })
-      // The stream is finished either way — nothing will ever be read from it
-      // again. Leaving the socket open would leave the client believing it has
-      // a working bridge, and every later question would hang for ever waiting
-      // on a pump that has already stopped. Close it so it reconnects.
-      closed = true
-      deliver?.(null)
-      session.close?.()
-      socket.close()
+      if (scope.live() && !closed) {
+        console.error('[jarvis] session error:', errorLabel(err))
+        scope.send({ type: 'error', message: 'The agent session failed. Check Claude authentication and local configuration.' })
+        scope.stop()
+        socket.close()
+      }
+    } finally {
+      scope.stop()
+      try { turn.session?.close() } catch { /* output remains quarantined */ }
+      seenTools.clear()
+      heldTools.clear()
+      if (active === turn) active = null
     }
-  })()
+  }
 
   socket.on('message', (raw) => {
     if (!messageAllowed()) return socket.close(1008, 'message limit')
     let msg
-    try {
-      msg = JSON.parse(raw.toString())
-    } catch {
-      return
-    }
+    try { msg = JSON.parse(raw.toString()) } catch { return }
     if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return
-
-    if (msg.type === 'ask' && typeof msg.text === 'string') {
-      if (Buffer.byteLength(msg.text) > 32768 || queued >= 2 || !askAllowed() || (msg.id && (typeof msg.id !== 'string' || msg.id.length > 128))) {
-        return send({ type: 'error', ask: typeof msg.id === 'string' ? msg.id.slice(0, 128) : null, message: 'Request limit reached. Retry shortly.' })
+    if (msg.type === 'ask') {
+      const id = msg.turnId
+      if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(id)) return
+      if (typeof msg.text !== 'string' || !msg.text.trim() || Buffer.byteLength(msg.text) > 32768 || !askAllowed() || recentIds.has(id)) {
+        return send({ scope: 'turn', type: 'error', turnId: id, message: 'Request limit reached or turn ID reused. Retry with a new interaction.' })
       }
-      queued++
-      /**
-       * Queued behind any interrupt that is still settling.
-       *
-       * A barge-in is two messages in quick succession — interrupt, then the
-       * new question — and session.interrupt() is asynchronous. Delivering the
-       * question the instant it arrives means the agent can still be winding
-       * down the previous turn, so its last tokens are emitted after the new
-       * one has begun and land on the new turn's listener. Measured: ask "one",
-       * interrupt, ask "two", and the answer to "two" comes back as "One."
-       *
-       * Waiting costs nothing when nothing is interrupting — the chain is an
-       * already-resolved promise — and removes the cross-talk when there is.
-       */
-      const text = msg.text
-      const id = typeof msg.id === 'string' ? msg.id : null
-      void settling.then(() => {
-        answering = id
-        if (deliver) {
-          const resolve = deliver
-          deliver = null
-          resolve(text)
-        } else {
-          inbox.push(text)
-        }
-      })
-    }
-
-    if (msg.type === 'reply' && typeof msg.id === 'string') {
-      const slot = waiting.get(msg.id)
-      if (slot) {
-        waiting.delete(msg.id)
-        clearTimeout(slot.timer)
-        slot.resolve(msg)
-      }
-    }
-
-    if (msg.type === 'interrupt') {
-      // Held so the next question can wait for it rather than racing it.
-      const stopped = turnFinished()
-      settling = Promise.resolve(session.interrupt?.())
-        .catch(() => {})
-        .then(() =>
-          Promise.race([
-            stopped,
-            new Promise((r) => setTimeout(r, SETTLE_CAP_MS)),
-          ]),
-        )
-    }
-  })
-
-  socket.on('close', () => {
-    if (wss.clients.size === 0) mcpState = 'not-loaded'
-    console.log('[jarvis] client disconnected')
-    closed = true
-    deliver?.(null)
-    session.close?.()
+      cancel(active, 'replaced')
+      recentIds.add(id)
+      if (recentIds.size > 64) recentIds.delete(recentIds.values().next().value)
+      const turn = { scope: createTurnScope(id, send), controller: new AbortController(), session: null }
+      active = turn
+      void run(turn, msg.text)
+    } else if (msg.type === 'reply') active?.scope.reply(msg)
+    else if (msg.type === 'cancel' && msg.turnId === active?.scope.turnId) cancel(active, 'frontend')
   })
 })
+
+// SDK close handles its own query resources. Descendant-process supervision is
+// intentionally outside this phase; late external tool effects cannot be undone.
+let stopping = false
+const shutdown = () => {
+  if (stopping) return
+  stopping = true
+  for (const request of httpRequests) request.abort()
+  httpRequests.clear()
+  for (const disconnect of connections) disconnect()
+  for (const socket of wss.clients) socket.close(1001, 'bridge shutdown')
+  const deadline = setTimeout(() => process.exit(0), 1000)
+  server.close(() => { clearTimeout(deadline); process.exit(0) })
+}
+process.once('SIGINT', shutdown)
+process.once('SIGTERM', shutdown)

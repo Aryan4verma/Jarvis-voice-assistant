@@ -1,9 +1,12 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
+import { abortable, browserRetrySafe, delay } from './abort.mjs'
 import { createSdkMcpServer, tool } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { createConnection } from 'node:net'
 import { readdir, stat } from 'node:fs/promises'
 import { userInfo } from 'node:os'
 import { join } from 'node:path'
+const turnContext = new AsyncLocalStorage()
 
 /**
  * JARVIS's hands on your actual browser.
@@ -113,7 +116,7 @@ async function findSocket() {
  * the browser is a single visible window doing one thing at a time, and the
  * model is watching each result before deciding the next action anyway.
  */
-class ChromeLink {
+export class ChromeLink {
   constructor() {
     this.socket = null
     this.path = null
@@ -123,6 +126,7 @@ class ChromeLink {
     this.buffer = Buffer.alloc(0)
     /** Resolver for the frame we are currently waiting on. */
     this.waiting = null
+    this.queued = 0
   }
 
   /** Drop the connection and forget it, so the next call re-discovers. */
@@ -165,9 +169,11 @@ class ChromeLink {
     }
   }
 
-  async ensureConnected() {
+  async ensureConnected(signal) {
+    signal?.throwIfAborted()
     if (this.socket && !this.socket.destroyed) return
     const path = await findSocket()
+    signal?.throwIfAborted()
     if (!path) {
       throw new Error(
         'The Claude browser extension is not running on this machine. ' +
@@ -176,34 +182,42 @@ class ChromeLink {
     }
     await new Promise((resolve, reject) => {
       const socket = createConnection(path)
+      const abort = () => { clearTimeout(timer); socket.destroy(); reject(signal.reason) }
+      signal?.addEventListener('abort', abort, { once: true })
       const timer = setTimeout(() => {
+        signal?.removeEventListener('abort', abort)
         socket.destroy()
         reject(new Error('the browser extension did not accept a connection'))
       }, CONNECT_TIMEOUT_MS)
 
       socket.once('connect', () => {
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
+        if (signal?.aborted) { socket.destroy(); reject(signal.reason); return }
         this.socket = socket
         this.path = path
-        socket.on('data', (chunk) => this.onData(chunk))
+        socket.on('data', (chunk) => { if (this.socket === socket) this.onData(chunk) })
         // Both of these mean the same thing to us: whatever we were waiting for
         // is not coming, and the next call must dial again from scratch. The
         // native host dies with Chrome, so this fires on every browser restart.
-        socket.on('error', (err) => this.reset(err))
-        socket.on('close', () => this.reset(new Error('the browser disconnected')))
+        socket.on('error', (err) => { if (this.socket === socket) this.reset(err) })
+        socket.on('close', () => { if (this.socket === socket) this.reset(new Error('the browser disconnected')) })
         resolve()
       })
       socket.once('error', (err) => {
         clearTimeout(timer)
+        signal?.removeEventListener('abort', abort)
         reject(err)
       })
     })
   }
 
   /** Send one framed message and wait for exactly one framed reply. */
-  async request(message) {
-    await this.ensureConnected()
+  async request(message, signal) {
+    await this.ensureConnected(signal)
+    signal?.throwIfAborted()
     return new Promise((resolve, reject) => {
+      const socket = this.socket
       const timer = setTimeout(() => {
         // A timed-out call leaves the stream ambiguous — a late reply would be
         // read as the answer to whatever runs next — so the connection goes
@@ -211,13 +225,17 @@ class ChromeLink {
         this.reset(new Error('the browser did not answer in time'))
       }, CALL_TIMEOUT_MS)
 
-      this.waiting = {
+      const abort = () => this.reset(new Error('Interaction cancelled; any dispatched browser action may already have executed'))
+      signal?.addEventListener('abort', abort, { once: true })
+      const waiter = this.waiting = {
         resolve: (value) => {
           clearTimeout(timer)
+          signal?.removeEventListener('abort', abort)
           resolve(value)
         },
         reject: (err) => {
           clearTimeout(timer)
+          signal?.removeEventListener('abort', abort)
           reject(err)
         },
       }
@@ -225,42 +243,34 @@ class ChromeLink {
       const body = Buffer.from(JSON.stringify(message), 'utf8')
       const header = Buffer.alloc(4)
       header.writeUInt32LE(body.length, 0)
-      this.socket.write(Buffer.concat([header, body]), (err) => {
-        if (err) {
+      socket.write(Buffer.concat([header, body]), (err) => {
+        if (err && this.socket === socket && this.waiting === waiter) {
           this.reset(err)
         }
       })
     })
   }
 
-  /**
-   * Run one extension tool. Queued behind whatever is already running.
-   *
-   * A dropped connection is retried exactly once, because the overwhelmingly
-   * common cause is a socket that went stale while JARVIS was idle — Chrome was
-   * restarted between two questions — and re-dialling silently is much better
-   * than telling the user their browser is unavailable when it is sitting right
-   * there. A second failure is real and is reported.
-   */
-  call(name, args) {
+  /** Retry only explicit reads. Ambiguous writes must never be replayed. */
+  call(name, args, signal = turnContext.getStore()) {
+    if (this.queued >= 16) return Promise.reject(new Error('Browser request queue is full'))
+    this.queued++
     const run = async () => {
+      signal?.throwIfAborted()
       const message = { method: 'execute_tool', params: { tool: name, args: args ?? {} } }
-      try {
-        return await this.request(message)
-      } catch (err) {
+      try { return await this.request(message, signal) }
+      catch {
+        if (signal?.aborted) throw signal.reason
         this.reset()
-        return await this.request(message)
+        if (!browserRetrySafe(name, args)) throw new Error('Browser action was not retried. If dispatched, its outcome is unknown; verify the result before repeating it.')
+        return await this.request(message, signal)
       }
     }
-    // Chained on the tail whether or not the previous call succeeded, so one
-    // failure cannot stall every later call behind a rejected promise.
-    const result = this.chain.then(run, run)
-    this.chain = result.then(
-      () => undefined,
-      () => undefined,
-    )
-    return result
+    const result = this.chain.then(run, run).finally(() => { this.queued-- })
+    this.chain = result.then(() => undefined, () => undefined)
+    return abortable(result, signal)
   }
+
 }
 
 const link = new ChromeLink()
@@ -434,7 +444,7 @@ async function settle(tab, target) {
       : ''
     const at = /^URL:\s*(\S+)/m.exec(text)
     if (at && samePage(at[1], target)) return
-    await new Promise((r) => setTimeout(r, SETTLE_GAP_MS))
+    await delay(SETTLE_GAP_MS, turnContext.getStore())
   }
 }
 
@@ -469,7 +479,7 @@ function forward(name, { needsTab = true } = {}) {
       // The tab we remembered has gone — the user closed it, or Chrome was
       // restarted under us. Forget it and try once with a fresh one before
       // reporting a browser that is actually working fine.
-      if (needsTab && reply?.error && /no tab available/i.test(JSON.stringify(reply.error))) {
+      if (needsTab && browserRetrySafe(name, sent) && reply?.error && /no tab available/i.test(JSON.stringify(reply.error))) {
         activeTab = null
         const tab = await resolveTab(undefined)
         if (tab !== null) reply = await link.call(name, { ...(args ?? {}), tabId: tab })
@@ -550,7 +560,7 @@ be clicked. Use chrome_page_text instead when you only want the prose.`
 /**
  * @param {{ allowWrites: boolean }} options
  */
-export function chromeServer({ allowWrites }) {
+export function chromeServer({ allowWrites, signal }) {
   const tools = [
     tool(
       'chrome_status',
@@ -610,7 +620,7 @@ export function chromeServer({ allowWrites }) {
           await settle(await resolveTab(args.tabId), url)
         } else {
           // back / forward: no target to compare against, so just let it breathe.
-          await new Promise((r) => setTimeout(r, 700))
+          await delay(700, turnContext.getStore())
         }
         return out
       },
@@ -809,7 +819,10 @@ export function chromeServer({ allowWrites }) {
     // Behind tool search the model would never think to look, and "open my
     // GitHub notifications" would quietly become a web search instead.
     alwaysLoad: true,
-    tools,
+    tools: tools.map((definition) => ({ ...definition, handler: (...args) => {
+      signal?.throwIfAborted()
+      return turnContext.run(signal, () => definition.handler(...args))
+    } })),
   })
 }
 

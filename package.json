@@ -14,6 +14,7 @@
     "build": "tsc -b && vite build",
     "lint": "oxlint",
     "test:security": "node --test tests/security.test.mjs tests/bridge-security.test.mjs",
+    "test:lifecycle": "node --loader ./tests/frontend-loader.mjs --test tests/lifecycle.test.mjs tests/backend-lifecycle.test.mjs",
     "preview": "vite preview",
     "bridge": "node scripts/bridge.mjs",
     "bridge:writes": "node scripts/bridge.mjs --writes",

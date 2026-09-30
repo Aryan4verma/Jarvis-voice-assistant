@@ -1,3 +1,4 @@
+import { abortable } from './turn'
 let initializing: Promise<void> | null = null
 
 /** Establish an HttpOnly session; credentials never enter JS or localStorage. */
@@ -15,11 +16,19 @@ export function ensureBridgeSession(refresh = false): Promise<void> {
 }
 
 export async function bridgeFetch(url: string, init?: RequestInit): Promise<Response> {
-  await ensureBridgeSession()
-  let response = await fetch(url, init)
+  if (init?.signal) await abortable(ensureBridgeSession(), init.signal)
+  else await ensureBridgeSession()
+  init?.signal?.throwIfAborted()
+  const request = () => {
+    const work = fetch(url, init)
+    return init?.signal ? abortable(work, init.signal) : work
+  }
+  let response = await request()
   if (response.status === 401) {
-    await ensureBridgeSession(true)
-    response = await fetch(url, init)
+    if (init?.signal) await abortable(ensureBridgeSession(true), init.signal)
+    else await ensureBridgeSession(true)
+    init?.signal?.throwIfAborted()
+    response = await request()
   }
   return response
 }

@@ -1,3 +1,6 @@
+import { abortable } from './turn'
+let generationTail = Promise.resolve()
+let queuedGenerations = 0
 /**
  * Neural speech, entirely in the browser.
  *
@@ -110,8 +113,10 @@ export async function load(): Promise<Kokoro | null> {
 }
 
 /** Synthesise one sentence. Returns null if the model isn't usable. */
-export async function speak(text: string): Promise<string | null> {
+async function generate(text: string, signal?: AbortSignal): Promise<string | null> {
+  if (signal?.aborted) return null
   const tts = await load()
+  if (signal?.aborted) return null
   if (!tts) return null
   try {
     const audio = await tts.generate(text, {
@@ -120,9 +125,11 @@ export async function speak(text: string): Promise<string | null> {
       // steadiness is most of the characterisation.
       speed: 0.95,
     })
+    if (signal?.aborted) return null
     failures = 0
     return URL.createObjectURL(audio.toBlob())
   } catch (err) {
+    if (signal?.aborted) return null
     // Surfaced rather than swallowed: a silent null here just looks like the
     // voice quietly reverting to the system one with no explanation.
     console.error('[jarvis] kokoro generation failed:', err)
@@ -138,6 +145,15 @@ export async function speak(text: string): Promise<string | null> {
     }
     return null
   }
+}
+
+/** Keep optional ONNX generation single-flight; kernels cannot be forcibly aborted. */
+export async function speak(text: string, signal?: AbortSignal): Promise<string | null> {
+  if (signal?.aborted || queuedGenerations >= 4) return null
+  queuedGenerations++
+  const work = generationTail.then(() => generate(text, signal)).finally(() => { queuedGenerations-- })
+  generationTail = work.then(() => undefined, () => undefined)
+  return signal ? abortable(work, signal) : work
 }
 
 /** Voice ids this build of the model actually carries. */

@@ -2,6 +2,7 @@ import type { AskHandlers } from './anthropic'
 import type { Blade, Panel } from '../store'
 import { BRIDGE_WS_URL } from '../config'
 import { ensureBridgeSession } from './bridgeSession'
+import { turns, TurnCancelled, type Turn } from './turn'
 
 /**
  * Client for the local bridge (see bridge/server.mjs).
@@ -10,8 +11,8 @@ import { ensureBridgeSession } from './bridgeSession'
  * brain is behind it. The difference is what's reachable: this one runs on your
  * machine, so every MCP server in your Claude Code config is in play.
  *
- * The socket is the session. The bridge holds one Claude Agent SDK query per
- * connection and the whole conversation lives inside it, so a dropped socket
+ * The socket is the session. The bridge resumes its SDK conversation between immutable per-turn
+ * queries. A dropped socket
  * silently wipes JARVIS's memory of the exchange while the transcript on screen
  * still shows it. That is why the reconnect below is loud rather than
  * invisible: `watchConnection` exists so the HUD can say so.
@@ -30,7 +31,8 @@ type Frame = {
   op?: string
   args?: unknown
   id?: string
-  ask?: string
+  turnId?: string
+  scope?: 'turn' | 'connection'
   reason?: string
   mode?: string
   seconds?: number
@@ -38,8 +40,6 @@ type Frame = {
   servers?: Array<string | { name?: string }>
 }
 
-/** Every question gets an id so its answer can be told from anyone else's. */
-let askSeq = 0
 
 let socket: WebSocket | null = null
 let connecting: Promise<WebSocket> | null = null
@@ -70,6 +70,9 @@ export function watchPanels(fn: (panel: Panel) => void) {
  * and its result is returned against the request's id.
  */
 export type CaptureRequest = {
+  turnId: string
+  id: string
+  signal: AbortSignal
   /** 'look' for a single frame, 'watch' for a grid over time. */
   mode: 'look' | 'watch'
   reason: string
@@ -143,9 +146,12 @@ let everConnected = false
 const RECONNECT_DELAYS = [500, 1000, 2000, 4000, 8000, 8000]
 let attempt = 0
 let reconnectTimer = 0
+let closing = false
+let connectionGeneration = 0
+let dialling: WebSocket | null = null
 
 function scheduleReconnect() {
-  if (attempt >= RECONNECT_DELAYS.length) return
+  if (closing || attempt >= RECONNECT_DELAYS.length) return
   const delay = RECONNECT_DELAYS[attempt]
   attempt += 1
   clearTimeout(reconnectTimer)
@@ -162,53 +168,44 @@ function scheduleReconnect() {
  */
 function dispatch(ws: WebSocket) {
   ws.addEventListener('message', (e: MessageEvent) => {
+    if (socket !== ws) return // Dead connections cannot update even global state.
     let msg: Frame
-    try {
-      msg = JSON.parse(e.data as string)
-    } catch {
-      return
-    }
-
-    if (msg.type === 'ready') {
-      // The bridge announces immediately on connect from Claude Code's config,
-      // then again with live status once the agent initialises. Keep listening
-      // so the later, more accurate list wins.
-      servers = (msg.servers ?? [])
-        .map((s) => (typeof s === 'string' ? s : (s.name ?? '')))
-        .filter(Boolean)
+    try { msg = JSON.parse(e.data as string) } catch { return }
+    if (!msg || typeof msg !== 'object') return
+    if (msg.scope === 'connection' && msg.type === 'ready') {
+      servers = (msg.servers ?? []).map((s) => typeof s === 'string' ? s : s.name ?? '').filter(Boolean)
       onServers?.(servers)
       firstReady.resolve()
-    } else if (msg.type === 'panel' && msg.panel) {
-      onPanel?.(msg.panel)
-    } else if (msg.type === 'blade' && msg.blade) {
-      onBlade?.(msg.blade)
-    } else if (msg.type === 'capture' && msg.id) {
-      const id = msg.id
-      const reply = (payload: Record<string, unknown>) => {
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'reply', id, ...payload }))
-        }
-      }
-      if (!onCapture) {
-        reply({ error: 'The interface has no camera handler.' })
-      } else {
-        // Always answers, even on failure: the bridge is holding a turn open
-        // waiting for this, and a rejection that never arrives is a turn that
-        // hangs until the idle timer notices.
-        onCapture({
-          mode: msg.mode === 'watch' ? 'watch' : 'look',
-          reason: msg.reason ?? '',
-          seconds: Math.max(2, Math.min(15, Number(msg.seconds) || 6)),
-          when: msg.when === 'past' ? 'past' : 'now',
-        })
-          .then(reply)
-          .catch((err) => reply({ error: String(err?.message ?? err) }))
-      }
-    } else if (msg.type === 'ui' && msg.op) {
-      // A `ui` frame with no args is normal — reset and clear take none — so an
-      // absent args object is an empty one, not a reason to drop the command.
-      onUi?.(msg.op, (msg.args ?? {}) as Record<string, unknown>)
+      return
     }
+    const owner = pending
+    if (!owner || owner.ws !== ws || msg.scope !== 'turn' || msg.turnId !== owner.turn.turnId || !owner.turn.current()) return
+    owner.touch()
+    try {
+      if (msg.type === 'panel' && msg.panel) onPanel?.(msg.panel)
+      else if (msg.type === 'blade' && msg.blade) onBlade?.(msg.blade)
+      else if (msg.type === 'ui' && msg.op) onUi?.(msg.op, msg.args ?? {})
+      else if (msg.type === 'capture-cancel' && msg.id) { owner.captures.get(msg.id)?.abort(); owner.captures.delete(msg.id) }
+      else if (msg.type === 'capture' && msg.id) {
+        if (owner.captures.size >= 2 || owner.captures.has(msg.id)) return
+        const id = msg.id, controller = new AbortController()
+        owner.captures.set(id, controller)
+        const reply = (payload: CaptureResult) => {
+          if (pending === owner && owner.turn.current() && !controller.signal.aborted && ws.readyState === WebSocket.OPEN) {
+            try { ws.send(JSON.stringify({ type: 'reply', turnId: owner.turn.turnId, id, ...payload })) }
+            catch { owner.turn.cancel('disconnect') }
+          }
+        }
+        Promise.resolve().then(() => {
+          controller.signal.throwIfAborted()
+          if (!onCapture) return { error: 'The interface has no camera handler.' }
+          return onCapture({ turnId: owner.turn.turnId, id, signal: controller.signal,
+            mode: msg.mode === 'watch' ? 'watch' : 'look', reason: msg.reason ?? '',
+            seconds: Math.max(2, Math.min(15, Number(msg.seconds) || 6)), when: msg.when === 'past' ? 'past' : 'now' })
+        }).then(reply, () => reply({ error: 'Camera capture failed or was cancelled.' }))
+          .finally(() => { if (owner.captures.get(id) === controller) owner.captures.delete(id) })
+      } else owner.frame(msg)
+    } catch (err) { owner.fail(err instanceof Error ? err : new Error('Bridge event failed')) }
   })
 }
 
@@ -216,10 +213,15 @@ function connect(): Promise<WebSocket> {
   if (socket?.readyState === WebSocket.OPEN) return Promise.resolve(socket)
   if (connecting) return connecting
 
+  closing = false
+  clearTimeout(reconnectTimer)
+  const generation = ++connectionGeneration
   firstReady = deferred()
 
   connecting = ensureBridgeSession(true).then(() => new Promise<WebSocket>((resolve, reject) => {
+    if (generation !== connectionGeneration || closing) { reject(new Error('Bridge closed')); return }
     const ws = new WebSocket(BRIDGE_WS_URL)
+    dialling = ws
     let settled = false
 
     /**
@@ -232,7 +234,8 @@ function connect(): Promise<WebSocket> {
       if (settled) return
       settled = true
       clearTimeout(timer)
-      connecting = null
+      if (generation === connectionGeneration) connecting = null
+      if (dialling === ws) dialling = null
       if (err) reject(err)
       else resolve(ws)
     }
@@ -243,6 +246,7 @@ function connect(): Promise<WebSocket> {
     }, 6000)
 
     ws.onopen = () => {
+      if (generation !== connectionGeneration || closing) { ws.close(); settle(new Error('Bridge closed')); return }
       socket = ws
       attempt = 0
       dispatch(ws)
@@ -279,11 +283,16 @@ function connect(): Promise<WebSocket> {
       settle(new Error('The bridge closed the connection.'))
       if (socket === ws) {
         socket = null
-        onConnection?.('lost')
+        if (pending?.ws === ws) pending.turn.cancel('disconnect')
+        turns.cancel('disconnect') // Includes speech still draining after backend completion.
+        if (!closing) onConnection?.('lost')
         scheduleReconnect()
       }
     }
-  })).catch((err) => { connecting = null; throw err })
+  })).catch((err) => {
+    if (generation === connectionGeneration) { connecting = null; if (everConnected && !closing) scheduleReconnect() }
+    throw err
+  })
 
   return connecting
 }
@@ -293,10 +302,13 @@ export async function warmBridge(): Promise<void> {
   await connect()
   // Don't block startup if the bridge never announces — the dispatcher fills
   // the rail in whenever the list does turn up.
-  await Promise.race([
-    firstReady.promise,
-    new Promise<void>((resolve) => setTimeout(resolve, 2500)),
-  ])
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      firstReady.promise,
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, 2500) }),
+    ])
+  } finally { clearTimeout(timer) }
 }
 
 // ---------------------------------------------------------------------------
@@ -311,189 +323,85 @@ export async function warmBridge(): Promise<void> {
  */
 const IDLE_TIMEOUT_MS = 120_000
 
-/** The turn in flight, so a barge-in can settle it locally. */
-let pending: { finish: (fallback?: string) => void } | null = null
+type Pending = {
+  turn: Turn
+  ws: WebSocket | null
+  captures: Map<string, AbortController>
+  touch: () => void
+  frame: (msg: Frame) => void
+  fail: (error: Error) => void
+}
+let pending: Pending | null = null
 
-export async function ask(
-  prompt: string,
-  handlers: AskHandlers,
-): Promise<{ text: string; tools: string[] }> {
-  /**
-   * A new question supersedes the one in flight.
-   *
-   * Two concurrent turns genuinely would corrupt each other — both listeners
-   * see every delta, and the first 'done' resolves both with the other's text —
-   * but refusing the new one was the wrong way to prevent that. It surfaced as
-   * "JARVIS is already answering", which is a sentence about this module's
-   * bookkeeping rather than about anything the user did, and it contradicts the
-   * premise the whole app is built on: say something and it becomes the turn.
-   *
-   * It fired far more than it looked like it should, because the only thing
-   * that cleared the slot was a barge-in — and a barge-in only fires in guard
-   * mode. A transcript can arrive well after the speech that produced it: the
-   * segment queue means several can be waiting, and their onsets happened while
-   * the machine was still listening, when nothing interrupts. So the second
-   * utterance of a normal sentence could land on a turn that was already
-   * running and simply be refused.
-   *
-   * Cancelling settles the old promise synchronously, so by the time the code
-   * below claims the slot there is nothing left to collide with. The abandoned
-   * turn's caller sees its own `stale()` check and stands down quietly.
-   */
-  if (pending) cancel()
-
-  // Claim the slot in this same tick. connect() below awaits, and two calls
-  // made before it settles would otherwise both sail past the check above.
-  let cancelledWhileDialling = false
-  pending = {
-    finish: () => {
-      cancelledWhileDialling = true
-    },
-  }
-
-  let ws: WebSocket
-  try {
-    ws = await connect()
-  } catch (err) {
-    pending = null
-    throw err
-  }
-
-  // Barged in on before the socket was even up. Nothing was ever asked.
-  if (cancelledWhileDialling) {
-    pending = null
-    return { text: '', tools: [] }
-  }
-
-  const id = `a${++askSeq}`
-  const tools: string[] = []
-  let text = ''
-
+export function ask(prompt: string, handlers: AskHandlers, turn: Turn): Promise<{ text: string; tools: string[] }> {
+  if (pending && pending.turn !== turn) pending.turn.cancel('replaced')
   return new Promise((resolve, reject) => {
-    let done = false
-    let timer = 0
-
+    let text = '', done = false, timer: ReturnType<typeof setTimeout> | null = null
+    const tools: string[] = []
     const cleanup = () => {
       done = true
-      pending = null
-      clearTimeout(timer)
-      ws.removeEventListener('message', onMessage)
-      ws.removeEventListener('close', onClose)
-      ws.removeEventListener('error', onError)
+      if (pending === owner) pending = null
+      if (timer) clearTimeout(timer)
+      turn.signal.removeEventListener('abort', abort)
+      for (const capture of owner.captures.values()) capture.abort()
+      owner.captures.clear()
     }
-
-    const finish = (fallback = '') => {
+    const abort = () => {
       if (done) return
-      cleanup()
-      // Prefer the streamed text; fall back to the final result if this build
-      // didn't emit deltas.
-      resolve({ text: (text || fallback).trim(), tools })
-    }
-
-    const fail = (err: Error) => {
-      if (done) return
-      cleanup()
-      reject(err)
-    }
-
-    const arm = () => {
-      clearTimeout(timer)
-      timer = window.setTimeout(() => {
-        fail(new Error('The bridge went quiet — that turn was lost, sir.'))
-      }, IDLE_TIMEOUT_MS)
-    }
-
-    const onMessage = (e: MessageEvent) => {
-      // Any frame at all is proof of life, including ones this turn ignores.
-      arm()
-
-      let msg: Frame
-      try {
-        msg = JSON.parse(e.data as string)
-      } catch {
-        // A frame we can't read is not a reason to abandon the turn. It used
-        // to be: the parse threw inside the listener, nothing settled the
-        // promise, and App's `busy` flag stayed true for the life of the page.
-        return
+      if (owner.ws?.readyState === WebSocket.OPEN) {
+        try { owner.ws.send(JSON.stringify({ type: 'cancel', turnId: turn.turnId })) } catch { /* disconnected */ }
       }
-
-      /**
-       * Somebody else's answer.
-       *
-       * A superseded turn keeps streaming for a moment after it is abandoned,
-       * and this listener is attached to the socket rather than to a turn — so
-       * without this check the tail of the old answer is read as the beginning
-       * of the new one. Measured before it existed: ask for ALPHA, barge in,
-       * ask for BRAVO, and BRAVO's answer came back as "ALPHA".
-       */
-      if (msg.ask && msg.ask !== id) return
-
-      try {
-        switch (msg.type) {
-          case 'text':
-            text += msg.delta ?? ''
-            handlers.onText(msg.delta ?? '')
-            break
-
-          case 'tool':
-            if (!msg.name) break
-            tools.push(msg.name)
-            handlers.onTool(prettyToolName(msg.name))
-            break
-
-          case 'done':
-            finish(msg.text ?? '')
-            break
-
-          case 'error':
-            fail(new Error(msg.message ?? 'The bridge reported an error.'))
-            break
-        }
-      } catch (err) {
-        fail(err instanceof Error ? err : new Error(String(err)))
-      }
+      cleanup()
+      reject(turn.signal.reason ?? new TurnCancelled('stop'))
     }
-
-    const onClose = () => {
-      fail(new Error('The bridge disconnected mid-answer — that session is gone.'))
+    const owner: Pending = {
+      turn, ws: null, captures: new Map(),
+      touch() {
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(() => turn.cancel('timeout'), IDLE_TIMEOUT_MS)
+      },
+      fail(error) {
+        if (done) return
+        turn.cancel('error', error.message)
+      },
+      frame(msg) {
+        if (done) return
+        if (msg.type === 'text') { text += msg.delta ?? ''; handlers.onText(msg.delta ?? '') }
+        else if (msg.type === 'tool' && msg.name) {
+          if (tools.length < 256) tools.push(msg.name)
+          handlers.onTool(prettyToolName(msg.name))
+        } else if (msg.type === 'done') {
+          // SDK builds without deltas still need an audible answer.
+          if (!text && msg.text) { text = msg.text; handlers.onText(text) }
+          cleanup(); resolve({ text: text.trim(), tools })
+        } else if (msg.type === 'error') owner.fail(new Error(msg.message ?? 'The bridge reported an error.'))
+        else if (msg.type === 'cancelled') turn.cancel('stop')
+      },
     }
-    const onError = () => {
-      fail(new Error('The connection to the bridge failed.'))
-    }
-
-    pending = { finish }
-    ws.addEventListener('message', onMessage)
-    ws.addEventListener('close', onClose)
-    ws.addEventListener('error', onError)
-    arm()
-
-    try {
-      ws.send(JSON.stringify({ type: 'ask', text: prompt, id }))
-    } catch (err) {
-      // The socket can go into CLOSING between connect() resolving and here.
-      fail(err instanceof Error ? err : new Error(String(err)))
-    }
+    pending = owner
+    turn.signal.addEventListener('abort', abort, { once: true })
+    if (!turn.current()) { abort(); return }
+    owner.touch()
+    void connect().then((ws) => {
+      if (done || pending !== owner || !turn.current()) return
+      owner.ws = ws
+      try { ws.send(JSON.stringify({ type: 'ask', turnId: turn.turnId, text: prompt })) }
+      catch { turn.cancel('disconnect') }
+    }, () => { if (!done) turn.cancel('disconnect') })
   })
 }
 
-/**
- * Cut JARVIS off mid-answer.
- *
- * Tells the bridge to stop, then settles the in-flight turn here rather than
- * waiting for a 'done' that a barge-in may never produce. Whatever he had
- * already said is returned, so the caller's await always comes back and the
- * transcript keeps the half-sentence the user actually heard.
- */
-export function cancel(): void {
-  if (socket?.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: 'interrupt' }))
-  }
-  pending?.finish()
-}
-
-/** The older name for `cancel()`. */
-export function interrupt(): void {
-  cancel()
+/** No request replay on reconnect. A dead connection loses its owned turn. */
+export function shutdown(): void {
+  closing = true
+  connectionGeneration++
+  clearTimeout(reconnectTimer)
+  pending?.turn.cancel('shutdown')
+  dialling?.close()
+  socket?.close()
+  socket = null
+  connecting = null
+  servers = []
 }
 
 /** `mcp__higgsfield__generate_image` -> `higgsfield · generate image` */

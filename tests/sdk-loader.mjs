@@ -19,6 +19,44 @@ export function query({ prompt }) {
   return stream;
 }
 `
+const lifecycle = `
+export const tool = (name, description, schema, handler) => ({ name, handler });
+export const createSdkMcpServer = (options) => options;
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+export function query({ prompt, options }) {
+  let closed = false;
+  options.abortController.signal.addEventListener('abort', () => console.log('[test] SDK abort invoked'), {once:true});
+  if (options.resume) console.log('[test] SDK resume supplied');
+  const effects = async () => {
+    await options.mcpServers.jarvis.tools.find(t => t.name === 'display').handler({title:'Fixture',html:'<p>Fixture</p>'});
+    await options.mcpServers.jarvis.tools.find(t => t.name === 'blade').handler({kind:'image',title:'Fixture',url:'data:image/png;base64,eA=='});
+    await options.mcpServers.jarvis_ui.tools.find(t => t.name === 'ui_reset').handler({});
+  };
+  const stream = (async function* () {
+    for await (const message of prompt) {
+      const text = message.message.content;
+      yield {type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text}}};
+      if (text === 'late-A' || text === 'hold-camera') {
+        const capture = options.mcpServers.jarvis_eyes.tools.find(t=>t.name==='look').handler({reason:'Fixture'});
+        if (text === 'hold-camera') { await capture; console.log('[test] camera wait cleared'); }
+        else {
+          capture.then(() => console.log('[test] camera wait cleared'));
+          await effects();
+          // Deliberately ignore abort/close so late callbacks exercise quarantine.
+          await wait(180); await effects();
+          options.mcpServers.jarvis_eyes.tools.find(t=>t.name==='look').handler({reason:'Late fixture'}).then(()=>{});
+          yield {type:'stream_event',event:{type:'content_block_delta',delta:{type:'text_delta',text:'late-output'}}};
+          yield {type:'result',subtype:'error_during_execution'};
+        }
+      }
+      if (text === 'B') await wait(300);
+      yield {type:'result',subtype:'success',result:text,session_id:'11111111-1111-4111-8111-111111111111'};
+    }
+  })();
+  stream.close = () => { if (!closed) { closed = true; console.log('[test] SDK close invoked'); } };
+  return stream;
+}
+`
 const network = `
 import { Readable } from 'node:stream';
 import * as real from ${JSON.stringify(pathToFileURL(join(ROOT, 'bridge/net.mjs')).href)};
@@ -40,7 +78,7 @@ export async function openRemote(url, headers, timeout) {
 `
 export async function resolve(specifier, context, next) {
   if (specifier === '@anthropic-ai/claude-agent-sdk') {
-    return { url: `data:text/javascript,${encodeURIComponent(source)}`, shortCircuit: true }
+    return { url: `data:text/javascript,${encodeURIComponent(process.env.JARVIS_TEST_LIFECYCLE === '1' ? lifecycle : source)}`, shortCircuit: true }
   }
   if (specifier === './net.mjs' && /\/bridge\/(server|page)\.mjs$/.test(context.parentURL || '')) {
     return { url: `data:text/javascript,${encodeURIComponent(network)}`, shortCircuit: true }

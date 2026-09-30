@@ -108,6 +108,9 @@ need network access when not already cached.
 `npm run preview` serves the production frontend; start `npm run bridge` in a
 second terminal for AI requests. Run `npm run test:security` for the focused
 bridge security suite; there is no full application end-to-end suite.
+Run `npm run test:lifecycle` for deterministic turn, cancellation, speech,
+camera, retry, and disconnect tests without AI credentials. See
+[TURN_LIFECYCLE.md](TURN_LIFECYCLE.md) for ownership and cancellation guarantees.
 Setup is advisory and does not establish Claude login or microphone/camera
 permissions. The existing Chrome native-host transport still assumes Unix
 sockets; Windows browser automation remains a later compatibility task.

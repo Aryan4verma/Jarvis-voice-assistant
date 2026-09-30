@@ -18,7 +18,9 @@ import { forTool, attention } from './lib/fillers'
 import {
   ask,
   warm,
-  interrupt,
+  cancel,
+  shutdown,
+  turns,
   watchServers,
   watchPanels,
   watchBlades,
@@ -32,6 +34,7 @@ import {
 import { startAnalyser, micLevel } from './lib/audio'
 import { probeCapabilities } from './lib/capabilities'
 import { env } from './config'
+import { delay, TurnCancelled, type Turn } from './lib/turn'
 
 /**
  * The conversation.
@@ -55,12 +58,6 @@ const AWAIT_SPEECH_MS = 14000
  *  again to continue a thought. */
 const FOLLOW_UP_MS = 11000
 
-/** crypto.randomUUID needs a secure context, which a LAN address over plain
- *  http is not. Not worth failing a whole turn over an id. */
-const newId = () =>
-  globalThis.crypto?.randomUUID?.() ??
-  `id${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`
-
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
  *  that woke him as "travis" gets that word sent on to the model as a question. */
 const NAME = '(?:jarvis|jarvys|jervis|travis|jarviss|java\'s|jarv)'
@@ -76,13 +73,10 @@ export default function App() {
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<Voice | null>(null)
 
-  /**
-   * Monotonic turn counter. Every await in a turn checks it on the way out:
-   * if it has moved, that turn was superseded by a barge-in and must not touch
-   * the phase, the speaker, or the busy state on its way to the floor.
-   */
-  const turn = useRef(0)
+  const interaction = useRef<Turn | null>(null)
+  const lookingRequest = useRef<string | null>(null)
   const booting = useRef(false)
+  const lifetime = useRef(new AbortController())
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const voicePoll = useRef<ReturnType<typeof setInterval> | null>(null)
 
@@ -100,8 +94,9 @@ export default function App() {
 
   const goDormant = () => {
     clearIdle()
+    cancel('stop')
+    voice.current?.reset()
     silence()
-    turn.current++
     const s = store.getState()
     s.setCaption('')
     s.setActiveTool(null)
@@ -124,8 +119,29 @@ export default function App() {
   // -- one turn -------------------------------------------------------------
 
   const respond = async (said: string): Promise<void> => {
-    const mine = ++turn.current
-    const stale = () => mine !== turn.current
+    silence()
+    const mine = turns.begin()
+    interaction.current = mine
+    const stale = () => !mine.current()
+    voice.current?.reset()
+    const cancelled = () => {
+      if (interaction.current !== mine) return
+      interaction.current = null
+      speaker.current = null // the speaker's own abort listener stops only its audio
+      lookingRequest.current = null
+      store.getState().setLooking(null)
+      store.getState().setActiveTool(null)
+      music.working(false); music.duck(false); sfx.duck(false)
+      const reason = (mine.signal.reason as TurnCancelled)?.reason
+      if (reason === 'timeout' || reason === 'disconnect' || reason === 'error') {
+        voice.current?.reset()
+        store.getState().setError(reason === 'timeout'
+          ? 'Interaction timed out. Backend termination requested; late output is ignored.'
+          : reason === 'disconnect' ? 'Bridge disconnected. This interaction was cancelled.' : mine.signal.reason.message)
+        listen(FOLLOW_UP_MS)
+      }
+    }
+    mine.signal.addEventListener('abort', cancelled, { once: true })
 
     clearIdle()
     const s = store.getState()
@@ -134,15 +150,15 @@ export default function App() {
     s.clearPanels()
     s.clearBlades()
     s.setCaption('')
-    s.pushTurn({ id: newId(), role: 'user', text: said })
+    s.pushTurn({ id: `${mine.turnId}:user`, role: 'user', text: said })
     s.setPhase('thinking')
 
-    const spk = createSpeaker()
+    const spk = createSpeaker(mine)
     speaker.current = spk
     sfx.duck(true)
     music.duck(true)
 
-    const turnId = newId()
+    const turnId = mine.turnId
     let started = false
     let filled = false
 
@@ -180,7 +196,7 @@ export default function App() {
             spk.say(forTool(name))
           }
         },
-      })
+      }, mine)
 
       if (stale()) return
 
@@ -199,13 +215,17 @@ export default function App() {
       sfx.play('done')
     } catch (err) {
       if (stale()) return
-      console.error(err)
+      spk.cancel()
+      console.warn('[jarvis] interaction failed')
       sfx.play('error')
       store
         .getState()
         .setError(err instanceof Error ? err.message : 'Something went wrong.')
     } finally {
+      mine.signal.removeEventListener('abort', cancelled)
       if (!stale()) {
+        mine.complete()
+        if (interaction.current === mine) interaction.current = null
         speaker.current = null
         sfx.duck(false)
         music.duck(false)
@@ -277,10 +297,9 @@ export default function App() {
 
     silence()
     if (wasBusy) {
-      // Abandon the answer in flight. The turn counter moves in respond()'s
-      // replacement; bumping it here covers the case where nothing replaces it.
-      turn.current++
-      interrupt()
+      // Cancel now, even if the user never supplies a replacement request.
+      cancel('barge-in')
+      voice.current?.reset(true)
       store.getState().setActiveTool(null)
       music.working(false)
       sfx.duck(false)
@@ -305,6 +324,7 @@ export default function App() {
       return
     }
 
+    if (/^(?:stop|cancel|enough|quiet|never mind|forget it)(?:[,.]?\s+sir)?[.!?]*$/i.test(said)) { goDormant(); return }
     void respond(said)
   }
 
@@ -324,10 +344,12 @@ export default function App() {
     // twice, arming two voice loops and two download polls.
     if (booting.current) return
     booting.current = true
+    const signal = lifetime.current.signal
 
     try {
       await ignite()
     } catch (err) {
+      if (signal.aborted) return
       // The guard must not outlive a failed boot. Audio unlock can be refused,
       // the microphone prompt dismissed, the bridge unreachable at the wrong
       // moment — and with the flag still latched the ignition button was dead
@@ -347,11 +369,13 @@ export default function App() {
   }
 
   const ignite = async () => {
+    const signal = lifetime.current.signal
     const s = store.getState()
 
     // Must happen inside the click handler — browsers won't start an
     // AudioContext or speech synthesis without a user gesture.
     await sfx.unlockAudio()
+    signal.throwIfAborted()
     sfx.play('boot')
     // The score. Must be started from inside this click handler for the same
     // reason as the rest of the audio.
@@ -380,6 +404,8 @@ export default function App() {
             ? req.reason || 'reviewing the last few seconds'
             : `${req.reason || 'watching'} · ${req.seconds}s`
           : req.reason || 'taking a look'
+      req.signal.throwIfAborted()
+      lookingRequest.current = req.id
       store.getState().setLooking(note)
 
       // The past is only available if something has been remembering it, and
@@ -400,14 +426,14 @@ export default function App() {
       // whoever else was using it half way through a six-second watch.
       let held = false
       try {
-        await camera.holdCamera()
+        await camera.holdCamera(req.signal)
         held = true
         if (req.mode === 'look') return camera.grabFrame()
         if (req.when === 'past') {
           const grid = camera.recentGrid(req.seconds, 9)
           return grid ?? { error: 'There is not enough recent footage to review.' }
         }
-        return await camera.watchAhead(req.seconds, 9)
+        return await camera.watchAhead(req.seconds, 9, req.signal)
       } catch (err) {
         return {
           error:
@@ -417,7 +443,7 @@ export default function App() {
         }
       } finally {
         if (held) camera.releaseCamera()
-        store.getState().setLooking(null)
+        if (lookingRequest.current === req.id) { lookingRequest.current = null; store.getState().setLooking(null) }
       }
     })
 
@@ -446,7 +472,7 @@ export default function App() {
           s.clearScreen(a.what ?? 'all')
           break
         default:
-          console.warn('[jarvis] unknown ui op:', op, args)
+          console.warn('[jarvis] unknown ui operation')
       }
     })
     // In bridge mode the conversation lives in the agent session, which is tied
@@ -461,7 +487,7 @@ export default function App() {
           .setError('Bridge reconnected. The previous conversation was not kept.')
       }
     })
-    const warming = warm().catch((err: Error) => s.setError(err.message))
+    const warming = warm().catch((err: Error) => { if (!signal.aborted) s.setError(err.message) })
 
     if (!usingBridge && !env.anthropicKey) {
       s.setError(
@@ -491,8 +517,9 @@ export default function App() {
     // status bar, rings, suit schematic, reactor power-up — before the live
     // interface takes over. Kept a touch under the boot cue so the music is
     // still rising as the reactor lands.
-    await new Promise((r) => setTimeout(r, 9200)) // boot sequence
+    await delay(9200, signal) // boot sequence
     await warming
+    signal.throwIfAborted()
     store.getState().setConnected(connectedLabels())
     store.getState().setVoice(currentVoiceName())
 
@@ -508,21 +535,25 @@ export default function App() {
           'voice. Speech recognition is unaffected.',
       )
     }
+    signal.throwIfAborted()
 
     // Ask the bridge which speech engines exist before the loop starts, so the
     // first turn already uses ElevenLabs when a key is present and the browser
     // fallback when it is not — no flag, no reload.
     await probeCapabilities()
+    signal.throwIfAborted()
 
     // One voice loop, started once, running until the page closes.
-    voice.current = await startVoice({
+    const startedVoice = await startVoice({
       mode,
-      onWake,
-      onSpeechStart,
-      onPartial,
-      onUtterance,
-      onError: onVoiceError,
+      onWake: (text) => { if (!signal.aborted) onWake(text) },
+      onSpeechStart: () => { if (!signal.aborted) onSpeechStart() },
+      onPartial: (text) => { if (!signal.aborted) onPartial(text) },
+      onUtterance: (text) => { if (!signal.aborted) onUtterance(text) },
+      onError: (message) => { if (!signal.aborted) onVoiceError(message) },
     })
+    if (signal.aborted) { startedVoice.stop(); return }
+    voice.current = startedVoice
 
     store.getState().setPhase('dormant')
   }
@@ -561,6 +592,7 @@ export default function App() {
   // -- level pump + keys ----------------------------------------------------
 
   useEffect(() => {
+    if (lifetime.current.signal.aborted) lifetime.current = new AbortController()
     let raf = 0
 
     const pump = () => {
@@ -593,6 +625,7 @@ export default function App() {
         e.preventDefault()
         const name = cycleVoice()
         store.getState().setVoice(name)
+        cancel('stop')
         silence()
         const demo = createSpeaker()
         speaker.current = demo
@@ -635,11 +668,13 @@ export default function App() {
       // — and it prints the verdict rather than making you infer it.
       if (e.key === 't' && !e.repeat && !e.metaKey && !e.ctrlKey && !e.altKey) {
         e.preventDefault()
+        cancel('stop')
         silence()
         const t = createSpeaker()
         speaker.current = t
         t.say('Audio test. If you can hear this, speech output is working, sir.')
         void t.end().then(() => {
+          if (speaker.current !== t) return
           const d = (window as unknown as Record<string, Record<string, unknown>>).__tts
           console.info('[jarvis] audio test →', d)
           if (d && d.started === 0 && d.rescued === 0) {
@@ -685,7 +720,9 @@ export default function App() {
     return () => {
       cancelAnimationFrame(raf)
       window.removeEventListener('keydown', onKey)
+      lifetime.current.abort()
       clearIdle()
+      shutdown()
       if (voicePoll.current) clearInterval(voicePoll.current)
       voice.current?.stop()
       speaker.current?.cancel()

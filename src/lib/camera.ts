@@ -1,3 +1,4 @@
+import { delay } from './turn'
 /**
  * The camera, and everything that looks through it.
  *
@@ -38,11 +39,15 @@ let stream: MediaStream | null = null
 let video: HTMLVideoElement | null = null
 /** How many things currently need the camera. It closes at zero, not before. */
 let holders = 0
+let opening: Promise<void> | null = null
+let startingStream: MediaStream | null = null
+const waiting = new Set<{ resolve: (video: HTMLVideoElement) => void; reject: (error: unknown) => void }>()
 
 export const diag = {
   open: false,
   holders: 0,
   buffered: 0,
+  pending: 0,
   lastError: '',
 }
 
@@ -60,33 +65,50 @@ if (typeof window !== 'undefined') {
  * everyone still using it, and the symptom is another feature going blind for
  * reasons that have nothing to do with it.
  */
-export async function holdCamera(): Promise<HTMLVideoElement> {
+export async function holdCamera(signal?: AbortSignal): Promise<HTMLVideoElement> {
+  signal?.throwIfAborted()
   holders++
   diag.holders = holders
-  if (video && stream) return video
-
+  let released = false
+  const release = () => { if (!released) { released = true; releaseCamera() } }
+  signal?.addEventListener('abort', release, { once: true })
   try {
-    stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 1280, height: 720, facingMode: 'user' },
+    if (!opening && !(video && stream)) {
+      opening = (async () => {
+        const acquired = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' } })
+        startingStream = acquired
+        const el = document.createElement('video')
+        try {
+          if (!holders) throw new Error('Camera request abandoned')
+          el.autoplay = true; el.playsInline = true; el.muted = true; el.srcObject = acquired
+          await el.play()
+          if (!holders || startingStream !== acquired) throw new Error('Camera request abandoned')
+          stream = acquired; video = el; diag.open = true; diag.lastError = ''
+          return el
+        } catch (err) {
+          acquired.getTracks().forEach((track) => track.stop())
+          el.pause(); el.srcObject = null
+          throw err
+        } finally { if (startingStream === acquired) startingStream = null }
+      })().then((ready) => { for (const slot of [...waiting]) slot.resolve(ready) },
+        (err) => { for (const slot of [...waiting]) slot.reject(err) }).finally(() => { opening = null })
+    }
+    const result = video && stream ? video : await new Promise<HTMLVideoElement>((resolve, reject) => {
+      if (waiting.size >= 16) { reject(new Error('Camera request limit reached')); return }
+      const cleanup = () => { waiting.delete(slot); diag.pending = waiting.size; signal?.removeEventListener('abort', abort) }
+      const slot = { resolve: (ready: HTMLVideoElement) => { cleanup(); resolve(ready) }, reject: (err: unknown) => { cleanup(); reject(err) } }
+      const abort = () => slot.reject(signal?.reason)
+      waiting.add(slot); diag.pending = waiting.size
+      signal?.addEventListener('abort', abort, { once: true })
+      if (signal?.aborted) abort()
     })
-    const el = document.createElement('video')
-    el.autoplay = true
-    el.playsInline = true
-    el.muted = true
-    el.srcObject = stream
-    await el.play()
-    video = el
-    diag.open = true
-    diag.lastError = ''
-    return el
+    signal?.throwIfAborted()
+    return result
   } catch (err) {
-    // The hold is given back on failure, or the count drifts up for ever and
-    // the camera can never be closed.
-    holders = Math.max(0, holders - 1)
-    diag.holders = holders
-    diag.lastError = String((err as Error)?.message ?? err)
+    release()
+    if (!signal?.aborted) diag.lastError = 'Camera unavailable'
     throw err
-  }
+  } finally { signal?.removeEventListener('abort', release) }
 }
 
 /** Give back a hold. The camera light goes out when the last one does. */
@@ -105,6 +127,8 @@ export function releaseCamera(): void {
   // every other claim this interface makes about its camera.
   stream?.getTracks().forEach((t) => t.stop())
   stream = null
+  startingStream?.getTracks().forEach((t) => t.stop())
+  startingStream = null
   diag.open = false
 }
 
@@ -248,6 +272,7 @@ function sample<T>(items: T[], want: number): T[] {
 export async function watchAhead(
   seconds: number,
   frames: number,
+  signal: AbortSignal = new AbortController().signal,
 ): Promise<{ data: string; mimeType: string }> {
   if (!video?.videoWidth) throw new Error('the camera is not ready')
   const shots: Shot[] = []
@@ -255,11 +280,12 @@ export async function watchAhead(
   const gap = (seconds * 1000) / Math.max(1, frames - 1)
 
   for (let i = 0; i < frames; i++) {
+    signal.throwIfAborted()
     const cell = document.createElement('canvas')
     if (drawTo(cell, CELL_W, CELL_H)) {
       shots.push({ at: performance.now(), bitmap: cell })
     }
-    if (i < frames - 1) await new Promise((r) => setTimeout(r, gap))
+    if (i < frames - 1) await delay(gap, signal)
   }
   if (!shots.length) throw new Error('no frames were captured')
   return contactSheet(shots, started)

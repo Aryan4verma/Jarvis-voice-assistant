@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk'
+import { abortable, type Turn } from './turn'
 import { env, MODEL, FAST_MODE, SYSTEM_PROMPT, activeServers } from '../config'
 
 /**
@@ -21,12 +22,6 @@ export type AskHandlers = {
   onTool: (name: string) => void
 }
 
-/** The stream for the turn in flight, so a barge-in can abort it. Without this
- *  cutting JARVIS off only silenced the speaker: the model kept generating,
- *  and kept billing, into a browser nobody was listening to. */
-let active: ReturnType<typeof client.beta.messages.stream> | null = null
-let cancelled = false
-
 /**
  * A server-side tool loop that runs long enough gets paused rather than
  * finished: `stop_reason: 'pause_turn'`, resumable by replaying the assistant
@@ -48,11 +43,14 @@ const MAX_CONTINUATIONS = 3
 export async function ask(
   history: Msg[],
   handlers: AskHandlers,
+  owner: Turn,
 ): Promise<{ text: string; tools: string[] }> {
   const servers = activeServers()
   const usedTools: string[] = []
   let text = ''
-  cancelled = false
+  let active: ReturnType<typeof client.beta.messages.stream> | null = null
+  const abort = () => active?.abort()
+  owner.signal.addEventListener('abort', abort, { once: true })
 
   const betas = ['mcp-client-2025-11-20']
   if (FAST_MODE) betas.push('fast-mode-2026-02-01')
@@ -91,17 +89,19 @@ export async function ask(
     for (let turn = 0; ; turn++) {
       // A barge-in between continuations has no stream to abort, so the loop
       // has to check for itself rather than opening another one.
-      if (cancelled) return { text: text.trim(), tools: usedTools }
+      if (!owner.current()) return { text: text.trim(), tools: usedTools }
 
-      const stream = client.beta.messages.stream({ ...params, messages })
+      const stream = client.beta.messages.stream({ ...params, messages }, { signal: owner.signal, maxRetries: 0 })
       active = stream
 
       stream.on('text', (delta) => {
+        if (!owner.current()) return
         text += delta
         handlers.onText(delta)
       })
 
       stream.on('streamEvent', (event) => {
+        if (!owner.current()) return
         if (event.type !== 'content_block_start') return
         const block = event.content_block
 
@@ -111,26 +111,28 @@ export async function ask(
         // matching only the first meant a search produced no tool phase, no
         // spinner and no filler line. Just several seconds of silence.
         if (block.type === 'mcp_tool_use') {
-          usedTools.push(block.name)
+          if (usedTools.length < 256) usedTools.push(block.name)
           handlers.onTool(block.name)
         } else if (block.type === 'server_tool_use') {
-          usedTools.push(block.name)
+          if (usedTools.length < 256) usedTools.push(block.name)
           handlers.onTool(block.name.replace(/_/g, ' '))
         }
       })
 
       let final: Anthropic.Beta.BetaMessage
       try {
-        final = await stream.finalMessage()
+        final = await abortable(stream.finalMessage(), owner.signal)
       } catch (err) {
         // A barge-in aborts this stream on purpose. That surfaces as a
         // rejection, and it isn't an error the user should see a toast for —
         // hand back what he'd already said.
-        if (cancelled) return { text: text.trim(), tools: usedTools }
+        if (!owner.current()) return { text: text.trim(), tools: usedTools }
         throw err
       } finally {
         active = null
       }
+
+      if (!owner.current()) return { text: text.trim(), tools: usedTools }
 
       if (final.stop_reason === 'pause_turn' && turn < MAX_CONTINUATIONS) {
         messages = [...messages, { role: 'assistant', content: final.content }]
@@ -159,17 +161,10 @@ export async function ask(
       return { text: text.trim(), tools: usedTools }
     }
   } finally {
+    active?.abort()
     active = null
+    owner.signal.removeEventListener('abort', abort)
   }
-}
-
-/**
- * Barge-in. Stops the generation rather than just muting it, so cutting JARVIS
- * off stops the tokens and the bill along with the voice.
- */
-export function cancel(): void {
-  cancelled = true
-  active?.abort()
 }
 
 /**

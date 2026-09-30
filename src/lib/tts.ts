@@ -9,6 +9,7 @@ import {
 import * as kokoro from './kokoro'
 import { caps } from './capabilities'
 import { bridgeFetch } from './bridgeSession'
+import { type Turn } from './turn'
 
 /**
  * Speech output.
@@ -46,6 +47,8 @@ type Speaker = {
 // What he is saying right now
 // ---------------------------------------------------------------------------
 
+let speakingOwner: symbol | null = null
+let nativeOwner: symbol | null = null
 let speaking = ''
 let recent = ''
 let recentUntil = 0
@@ -336,7 +339,11 @@ type Item = {
   audio?: Promise<string | null> | null
 }
 
-export function createSpeaker(): Speaker {
+export function createSpeaker(turn?: Turn): Speaker {
+  const owner = Symbol(turn?.turnId ?? 'auxiliary speech')
+  const controller = new AbortController()
+  let finishPlayback: (() => void) | null = null
+  let sealed = false
   const queue: Item[] = []
   let buffer = ''
   let cancelled = false
@@ -354,12 +361,13 @@ export function createSpeaker(): Speaker {
   }
 
   const enqueue = (sentence: string, priority = false) => {
-    if (cancelled) return
+    if (cancelled || sealed || turn?.signal.aborted) return
     // Shape once here so both engines get the same text — stripped markdown,
     // and the comma before "sir" that buys the beat.
     const text = shape(sentence)
     if (!text) return
 
+    if (queue.length >= 128) return
     const item: Item = { text }
     if (priority) {
       // Genuinely ahead of the queue this time. The old `say()` appended to the
@@ -386,11 +394,11 @@ export function createSpeaker(): Speaker {
       // ElevenLabs, which makes the one field naming the engine useless
       // exactly when you are trying to work out which engine is at fault.
       diag.engine = 'elevenlabs'
-      return fetchCloudAudio(text).catch(() => null)
+      return fetchCloudAudio(text, controller.signal, turn?.turnId).catch(() => null)
     }
     if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
       diag.engine = 'kokoro'
-      return kokoro.speak(text).catch(() => null)
+      return kokoro.speak(text, controller.signal).catch(() => null)
     }
     diag.engine = 'system'
     return null
@@ -398,7 +406,12 @@ export function createSpeaker(): Speaker {
 
   /** Start generating an item's audio if it hasn't begun. */
   const prime = (item: Item | undefined) => {
-    if (item && item.audio === undefined) item.audio = synthesise(item.text)
+    if (item && item.audio === undefined) {
+      item.audio = synthesise(item.text)?.then((url) => {
+        if (cancelled && url) { URL.revokeObjectURL(url); return null }
+        return url
+      }) ?? null
+    }
   }
 
   async function pump(): Promise<void> {
@@ -426,10 +439,11 @@ export function createSpeaker(): Speaker {
 
   async function speakOne(item: Item): Promise<void> {
     if (cancelled) return
+    speakingOwner = owner
     setSpeaking(item.text)
     try {
       const url = item.audio ? await item.audio : null
-      if (cancelled) return
+      if (cancelled) { if (url) URL.revokeObjectURL(url); return }
       // A failed generation is not a failed turn — drop to the system voice.
       if (url) {
         await playUrl(url, item.text)
@@ -450,13 +464,14 @@ export function createSpeaker(): Speaker {
         diag.engine = 'elevenlabs'
         console.warn('[jarvis] system voice is not producing sound — using the bridge speech proxy from here on')
       }
-      const rescue = await fetchCloudAudio(item.text).catch(() => null)
+      const rescue = await fetchCloudAudio(item.text, controller.signal, turn?.turnId).catch(() => null)
+      if (rescue && cancelled) URL.revokeObjectURL(rescue)
       if (rescue && !cancelled) {
         diag.rescued++
         await playUrl(rescue, item.text)
       }
     } finally {
-      if (speaking === item.text) setSpeaking('')
+      if (speakingOwner === owner) { speakingOwner = null; setSpeaking('') }
     }
   }
 
@@ -511,6 +526,9 @@ export function createSpeaker(): Speaker {
         if (done) return
         done = true
         nativeInFlight = false
+        if (nativeOwner === owner) nativeOwner = null
+        if (finishPlayback === finish) finishPlayback = null
+        u.onstart = u.onend = u.onerror = null
         if (watchdog) clearTimeout(watchdog)
         if (keepalive) clearInterval(keepalive)
         cancelAnimationFrame(raf)
@@ -521,7 +539,9 @@ export function createSpeaker(): Speaker {
         resolve(started)
       }
 
+      finishPlayback = finish
       u.onstart = () => {
+        if (done || cancelled || nativeOwner !== owner) return
         started = true
         diag.started++
         diag.lastError = ''
@@ -541,6 +561,7 @@ export function createSpeaker(): Speaker {
       // code — so an unlogged onerror turns a broken voice into an unexplained
       // quiet app, which is exactly the bug that took three attempts to find.
       u.onerror = (e) => {
+        if (done || cancelled || nativeOwner !== owner) return
         const code = String((e as SpeechSynthesisErrorEvent).error ?? 'unknown')
         diag.lastError = code
         // 'interrupted' and 'canceled' are us, cancelling deliberately on a
@@ -579,7 +600,8 @@ export function createSpeaker(): Speaker {
       diag.lastText = text.slice(0, 60)
       diag.voice = u.voice?.name ?? 'default'
       nativeInFlight = true
-      speechSynthesis.speak(u)
+      nativeOwner = owner
+      try { speechSynthesis.speak(u) } catch { finish() }
     })
 
   const playUrl = (url: string, text: string) =>
@@ -594,13 +616,16 @@ export function createSpeaker(): Speaker {
       diag.lastText = text.slice(0, 60)
       diag.voice = diag.engine === 'kokoro' ? KOKORO_VOICE : 'ElevenLabs'
 
+      const nodes: AudioNode[] = []
       let read: (() => number) | null = null
       const ctx = outputContext()
       if (ctx) {
         try {
           const analyser = ctx.createAnalyser()
           analyser.fftSize = 256
-          ctx.createMediaElementSource(audio).connect(analyser)
+          const source = ctx.createMediaElementSource(audio)
+          nodes.push(source, analyser)
+          source.connect(analyser)
           analyser.connect(ctx.destination)
           const bins = new Uint8Array(analyser.frequencyBinCount)
           read = () => {
@@ -628,18 +653,24 @@ export function createSpeaker(): Speaker {
         cancelAnimationFrame(raf)
         outLevel = 0.12
         URL.revokeObjectURL(url)
+        nodes.forEach((node) => node.disconnect())
+        audio.onplaying = audio.onended = audio.onerror = audio.onpause = null
+        if (finishPlayback === finish) finishPlayback = null
         if (currentAudio === audio) currentAudio = null
         resolve()
       }
       // Sound is genuinely coming out. This is the cloud/neural counterpart of
       // SpeechSynthesisUtterance.onstart, and it is what makes the diagnostics
       // verdict — and the T self-test — tell the truth on the premium path.
+      finishPlayback = finish
       audio.onplaying = () => {
+        if (done || cancelled) return
         diag.started++
         diag.lastError = ''
       }
       audio.onended = finish
       audio.onerror = () => {
+        if (done || cancelled) return
         // A decode or network failure on a blob we already hold is rare, but
         // silent when it happens: the sentence simply never plays and the queue
         // moves on. Count it rather than letting it look like nothing was said.
@@ -652,18 +683,19 @@ export function createSpeaker(): Speaker {
       // settles and every await behind it hangs for the life of the page.
       audio.onpause = finish
       void audio.play().catch((err) => {
+        if (done || cancelled) return
         diag.failures++
         diag.lastError = String((err as Error)?.name ?? 'play-rejected')
         finish()
       })
     })
 
-  return {
+  const speaker: Speaker = {
     say(text) {
       enqueue(text, true)
     },
     push(delta) {
-      if (cancelled) return
+      if (cancelled || sealed || turn?.signal.aborted) return
       buffer += delta
 
       // Drain every complete sentence sitting in the buffer.
@@ -703,23 +735,30 @@ export function createSpeaker(): Speaker {
         enqueue(buffer)
         buffer = ''
       }
-      if (cancelled) return
-      if (!pumping && !queue.length) return
-      await new Promise<void>((resolve) => drained.push(resolve))
+      sealed = true
+      if (!cancelled && (pumping || queue.length)) await new Promise<void>((resolve) => drained.push(resolve))
+      turn?.signal.removeEventListener('abort', stop)
     },
     cancel() {
       if (cancelled) return
       cancelled = true
+      controller.abort()
+      turn?.signal.removeEventListener('abort', stop)
       buffer = ''
+      for (const item of queue) void item.audio?.then((url) => { if (url) URL.revokeObjectURL(url) })
       queue.length = 0
       // Keep the echo tail: the words already in the air still have to be
       // recognised and discarded, even though he has stopped adding to them.
-      setSpeaking('')
+      if (speakingOwner === owner) { speakingOwner = null; setSpeaking('') }
 
       // Only reach for the global cancel if this speaker actually has a native
       // utterance out — speechSynthesis.cancel() is document-wide and would
       // otherwise silence an unrelated speaker mid-word.
-      if (nativeInFlight) {
+      const ownsNative = nativeInFlight && nativeOwner === owner
+      const audio = currentAudio
+      finishPlayback?.()
+      audio?.pause()
+      if (ownsNative) {
         nativeInFlight = false
         speechSynthesis.cancel()
         // Always pair the cancel with a resume — see the note in speakNative.
@@ -735,16 +774,22 @@ export function createSpeaker(): Speaker {
     },
     level: () => outLevel,
   }
+  const stop = () => speaker.cancel()
+  turn?.signal.addEventListener('abort', stop, { once: true })
+  if (turn?.signal.aborted) speaker.cancel()
+  return speaker
 }
 
 /** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
  *  the key), then a direct key, then null to fall back to the native voice. */
-async function fetchCloudAudio(text: string): Promise<string | null> {
+async function fetchCloudAudio(text: string, signal: AbortSignal, turnId?: string): Promise<string | null> {
+  if (signal.aborted) return null
   if (BACKEND === 'bridge') {
     try {
       const res = await bridgeFetch(`${BRIDGE_HTTP_URL}/tts`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...(turnId ? { 'x-jarvis-turn': turnId } : {}) },
+        signal,
         body: JSON.stringify({ text }),
       })
       if (res.ok) return URL.createObjectURL(await res.blob())
@@ -753,13 +798,14 @@ async function fetchCloudAudio(text: string): Promise<string | null> {
     }
   }
 
-  if (env.elevenKey) {
+  if (env.elevenKey && !signal.aborted) {
     try {
       const res = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${env.elevenVoiceId}/stream` +
           `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
         {
           method: 'POST',
+          signal,
           headers: {
             'xi-api-key': env.elevenKey,
             'content-type': 'application/json',

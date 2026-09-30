@@ -3,6 +3,8 @@ import * as direct from './anthropic'
 import * as bridge from './bridge'
 import type { AskHandlers, Msg } from './anthropic'
 import type { Blade, Panel } from '../store'
+import { turns, type Turn, type CancelReason } from './turn'
+export { turns } from './turn'
 
 export type { AskHandlers, Msg }
 export type { ConnectionState } from './bridge'
@@ -28,10 +30,11 @@ export async function ask(
   prompt: string,
   history: Msg[],
   handlers: AskHandlers,
+  turn: Turn,
 ): Promise<{ text: string; tools: string[] }> {
   return usingBridge
-    ? bridge.ask(prompt, handlers)
-    : direct.ask([...history, { role: 'user', content: prompt }], handlers)
+    ? bridge.ask(prompt, handlers, turn)
+    : direct.ask([...history, { role: 'user', content: prompt }], handlers, turn)
 }
 
 export async function warm(): Promise<void> {
@@ -84,21 +87,10 @@ export function watchCapture(
   if (usingBridge) bridge.watchCapture(fn)
 }
 
-/**
- * Barge-in. Stops the answer on both paths and settles whatever `ask()` call
- * is outstanding, so the caller's await always returns — on the bridge by
- * interrupting the agent and resolving with the text so far, on the direct
- * path by aborting the stream so the model stops generating and billing.
- */
-export function cancel(): void {
-  if (usingBridge) bridge.cancel()
-  else direct.cancel()
-}
-
-/** The older name for `cancel()`. */
-export function interrupt(): void {
-  cancel()
-}
+/** Cancel the authoritative owner; its signal stops transport, speech and camera waits. */
+export function cancel(reason: CancelReason = 'stop'): void { turns.cancel(reason) }
+export function interrupt(): void { cancel('barge-in') }
+export function shutdown(): void { cancel('shutdown'); if (usingBridge) bridge.shutdown() }
 
 /**
  * Whether the brain is reachable right now.

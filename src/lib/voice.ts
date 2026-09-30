@@ -4,6 +4,7 @@ import { getMic } from './audio'
 import { speakingNow, speakingSince } from './tts'
 import { startVad, type Vad } from './vad'
 import { caps } from './capabilities'
+import { abortable } from './turn'
 
 /**
  * The voice loop.
@@ -54,6 +55,7 @@ export type VoiceHandlers = {
 
 export type Voice = {
   stop: () => void
+  reset: (preserveInput?: boolean) => void
   /** True while a recogniser is actually running. */
   live: () => boolean
 }
@@ -397,7 +399,7 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
         ? 'Microphone access denied — voice input is unavailable.'
         : 'No microphone available.',
     )
-    return { stop: () => {}, live: () => false }
+    return { stop: () => {}, reset: () => {}, live: () => false }
   }
   diag.engine = caps().stt ? 'elevenlabs' : 'browser'
   return caps().stt ? startElevenVoice(h) : startBrowserVoice(h)
@@ -421,7 +423,9 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * Order is preserved because the drain is single-flight, which matters —
    * "London" arriving before "what's the weather in" is worse than either.
    */
-  const pendingAudio: Blob[] = []
+  const pendingAudio: Array<{ blob: Blob; epoch: number }> = []
+  let epoch = 0, segmentEpoch = 0, stopped = false
+  let transcription: AbortController | null = null
   let draining = false
 
   /**
@@ -446,7 +450,11 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
    * transcript arriving — and the transcript belongs to the mode the user is in
    * now, not the one they interrupted.
    */
-  const transcribe = async (blob: Blob) => {
+  const transcribe = async ({ blob, epoch: captured }: { blob: Blob; epoch: number }) => {
+    if (stopped || captured !== epoch) return
+    const controller = new AbortController()
+    transcription = controller
+    const current = () => !stopped && captured === epoch && !controller.signal.aborted
     const mode = h.mode()
     if (mode === 'deaf') return
     const t0 = performance.now()
@@ -455,7 +463,9 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         method: 'POST',
         headers: { 'content-type': blob.type || 'audio/webm' },
         body: blob,
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
       })
+      if (!current()) return
       diag.idleMs = Math.round(performance.now() - t0)
       if (!res.ok) {
         diag.restarts++
@@ -463,7 +473,8 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
         drop(`transcription failed (${res.status})`)
         return
       }
-      const { text } = (await res.json()) as { text?: string }
+      const { text } = (await abortable(res.json(), controller.signal)) as { text?: string }
+      if (!current()) return
       const said = (text ?? '').trim()
       diag.lastError = ''
 
@@ -498,11 +509,12 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       // Not a turn yet — a piece of one. The assembler decides when the thought
       // is finished, reading the words and whether the room is still noisy.
       assemble.feed(said, vad?.meter().speaking ?? false)
-    } catch (err) {
+    } catch {
+      if (!current()) return
       diag.restarts++
-      diag.lastError = String(err)
+      diag.lastError = 'Transcription failed'
       drop('could not reach the speech service')
-    }
+    } finally { if (transcription === controller) transcription = null }
   }
 
   /** One transcription at a time, in the order the segments were spoken. */
@@ -523,7 +535,8 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       const mode = h.mode()
       diag.mode = mode
       diag.sessions++
-      if (mode === 'deaf') return
+      segmentEpoch = epoch
+      if (stopped || mode === 'deaf') return
       // Standing down mid-thought throws the thought away with it. Otherwise
       // held text would surface as the opening of the *next* conversation.
       if (mode === 'wake') assemble.cancel()
@@ -537,13 +550,17 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
           return
         }
         h.onSpeechStart()
+        segmentEpoch = epoch
       }
     },
     onEnd: (blob) => {
-      pendingAudio.push(blob)
+      if (stopped || segmentEpoch !== epoch || h.mode() === 'deaf') return
+      if (pendingAudio.length >= 6 || pendingAudio.reduce((size, item) => size + item.blob.size, blob.size) > 8 * 1024 * 1024) { drop('transcription queue full'); return }
+      pendingAudio.push({ blob, epoch: segmentEpoch })
       void drain()
     },
     onLevel: (v) => {
+      if (stopped) return
       // Only paint the live level while actually listening for a command, so a
       // dormant reactor stays calm and does not twitch at every room noise.
       const mode = h.mode()
@@ -555,6 +572,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       h.onPartial(v > 0.04 ? '…' : '')
     },
     onError: (message) => {
+      if (stopped) return
       diag.lastError = 'capture'
       diag.running = false
       h.onError(message)
@@ -575,8 +593,12 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
     if ((mode === 'wake' || mode === 'deaf') && assemble.held()) assemble.cancel()
   }, 200)
 
+  const resetInput = () => { epoch++; transcription?.abort(); transcription = null; pendingAudio.length = 0; assemble.cancel() }
   return {
+    reset: resetInput,
     stop: () => {
+      stopped = true
+      resetInput()
       clearInterval(guardPoll)
       assemble.cancel()
       vad?.stop()
@@ -605,12 +627,13 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
     h.onError('This browser has no speech recognition — use Chrome or Edge, or add an ElevenLabs key.')
-    return { stop: () => {}, live: () => false }
+    return { stop: () => {}, reset: () => {}, live: () => false }
   }
 
   let stopped = false
   let running = false
   let rec: any = null
+  let restartTimer: ReturnType<typeof setTimeout> | null = null
   let settled = ''
   let interim = ''
   let started = false
@@ -758,18 +781,22 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
 
   const spin = () => {
     if (stopped || running) return
-    rec = new Ctor()
+    const recognizer = new Ctor()
+    rec = recognizer
+    running = true
     rec.continuous = true
     rec.interimResults = true
     rec.lang = 'en-GB'
     rec.onstart = () => {
+      if (stopped || rec !== recognizer) return
       running = true
       diag.running = true
       diag.sessions++
       touch()
     }
-    rec.onresult = onResult
+    rec.onresult = (event: any) => { if (!stopped && rec === recognizer) onResult(event) }
     rec.onerror = (ev: any) => {
+      if (stopped || rec !== recognizer) return
       diag.lastError = String(ev.error ?? '')
       if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
         stopped = true
@@ -778,18 +805,31 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
       }
     }
     rec.onend = () => {
+      if (rec !== recognizer) return
       running = false
       diag.running = false
       touch()
       rec = null
-      if (!stopped) setTimeout(spin, 80)
+      if (!stopped) { if (restartTimer) clearTimeout(restartTimer); restartTimer = setTimeout(spin, 80) }
     }
     try {
       rec.start()
     } catch {
       running = false
-      setTimeout(spin, 250)
+      restartTimer = setTimeout(spin, 250)
     }
+  }
+
+  const resetInput = (preserveInput = false) => {
+    assemble.cancel()
+    clearSilence()
+    if (preserveInput) return // The current barge-in words belong to the replacement.
+    reset()
+    const old = rec
+    rec = null; running = false; diag.running = false
+    if (old) { old.onstart = old.onresult = old.onerror = old.onend = null; try { old.abort() } catch { /* ended */ } }
+    if (restartTimer) clearTimeout(restartTimer)
+    if (!stopped) restartTimer = setTimeout(spin, 80)
   }
 
   spin()
@@ -802,21 +842,16 @@ function startBrowserVoice(h: VoiceHandlers): Voice {
     diag.idleMs = idle
     if (idle < 15000) return
     diag.restarts++
-    try {
-      rec?.abort()
-    } catch {
-      /* already gone */
-    }
-    rec = null
-    running = false
-    diag.running = false
+    resetInput()
     touch()
-    spin()
   }, 5000)
 
   return {
+    reset: resetInput,
     stop: () => {
       stopped = true
+      resetInput()
+      if (restartTimer) clearTimeout(restartTimer)
       clearInterval(health)
       clearSilence()
       assemble.cancel()
