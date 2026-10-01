@@ -31,7 +31,7 @@ export type AIErrorCategory = 'authentication' | 'rate-limit' | 'timeout' | 'una
 export type AIError = {
   category: AIErrorCategory
   message: string
-  diagnostics?: { providerId?: string; status?: number; code?: string }
+  diagnostics?: { providerId?: string; status?: number; code?: string; retryAfterSeconds?: number }
 }
 /** Lifecycle identity is supplied separately; it never comes from provider chunks. */
 export type AIEvent =

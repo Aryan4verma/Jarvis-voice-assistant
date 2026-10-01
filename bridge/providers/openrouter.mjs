@@ -51,11 +51,11 @@ export function createOpenRouterAdapter(config) {
             ...(available.length ? {tools:available.map(tool=>({type:'function',function:{name:tool.name,description:tool.description,parameters:tool.parameters}})),tool_choice:'auto'} : {}),
           },controller.signal),controller.signal)
           const before=text.length
-          for await(const chunk of routerFrames(response,controller.signal)) {
+          for await(const chunk of routerFrames(response,controller.signal,info.modelId)) {
             if(!current()) continue
-            if(chunk.error) throw new AIProviderError(routerError(chunk.error))
+            if(chunk.error) throw new AIProviderError(routerError({ ...chunk.error, modelId: info.modelId }))
             const choice=chunk.choices?.[0]
-            if(choice?.error) throw new AIProviderError(routerError(choice.error))
+            if(choice?.error) throw new AIProviderError(routerError({ ...choice.error, modelId: info.modelId }))
             if(typeof choice?.delta?.content==='string') {
               text+=choice.delta.content
               if(text.length>256*1024) throw new AIProviderError(aiError('unavailable',{providerId:'openrouter'},'The response exceeded its safe text limit.'))

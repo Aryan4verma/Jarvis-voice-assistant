@@ -18,6 +18,7 @@ export function aiError(category, diagnostics = {}, message) {
     if (typeof diagnostics[key] === 'string' && /^[a-z][a-z0-9_-]{0,63}$/.test(diagnostics[key]) && !/^(sk-|github_pat_|xox)/.test(diagnostics[key])) safe[key] = diagnostics[key]
   }
   if (Number.isInteger(diagnostics.status) && diagnostics.status >= 100 && diagnostics.status <= 599) safe.status = diagnostics.status
+  if (Number.isInteger(diagnostics.retryAfterSeconds) && diagnostics.retryAfterSeconds >= 0 && diagnostics.retryAfterSeconds <= 86400) safe.retryAfterSeconds = diagnostics.retryAfterSeconds
   return { category, message: message ?? messages[category], ...(Object.keys(safe).length ? { diagnostics: safe } : {}) }
 }
 export class AIProviderError extends Error {

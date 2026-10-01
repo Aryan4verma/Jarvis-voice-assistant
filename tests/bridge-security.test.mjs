@@ -73,10 +73,10 @@ test('real loopback bridge and Vite broker enforce authenticated routes and limi
       assert.ok([addresses].flat().every((address) => address === '127.0.0.1'), 'Bridge listener is not loopback-only')
     }
     assert.equal(await raw('/health', { host: `evil.example:${port}` }), 403)
-    for (const path of ['/ai/settings', '/ai/models', '/readiness', '/file?path=C%3A%5Cprivate.png', '/img?url=https://example.com', '/media?url=https://example.com', '/page?url=https://example.com']) {
+    for (const path of ['/voice/settings', '/ai/settings', '/ai/models', '/readiness', '/file?path=C%3A%5Cprivate.png', '/img?url=https://example.com', '/media?url=https://example.com', '/page?url=https://example.com']) {
       assert.equal((await get(path)).status, 401)
     }
-    for (const path of ['/ai/key', '/ai/test', '/tts', '/stt']) assert.equal((await fetch(base + path, { method: 'POST' })).status, 401)
+    for (const path of ['/voice/wake-session', '/voice/picovoice/key', '/voice/elevenlabs/key', '/ai/key', '/ai/test', '/tts', '/stt']) assert.equal((await fetch(base + path, { method: 'POST' })).status, 401)
     const ready = await get('/readiness', auth)
     assert.equal(ready.status, 200)
     assert.equal((await ready.json()).speech.readiness, 'not-validated')

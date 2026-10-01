@@ -20,7 +20,8 @@
     "preview": "vite preview",
     "bridge": "node scripts/bridge.mjs",
     "bridge:writes": "node scripts/bridge.mjs --writes",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node scripts/setup.mjs",
+    "test:voice": "node --loader ./tests/frontend-loader.mjs --test tests/voice-performance.test.mjs tests/microphone.test.mjs tests/voice-settings.test.mjs"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.220",

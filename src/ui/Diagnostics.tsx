@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useStore } from '../store'
+import { timingDurations, timingSnapshot, watchTiming } from '../lib/latency'
 import { bridgeReadiness } from '../lib/capabilities'
 
 /**
@@ -20,6 +21,7 @@ import { bridgeReadiness } from '../lib/capabilities'
  */
 
 type VoiceDiag = {
+  wakeEngine: string
   running: boolean
   sessions: number
   heard: string
@@ -76,8 +78,9 @@ export function Diagnostics() {
 
   useEffect(() => {
     if (!open) return
+    const unsubscribe = watchTiming(() => tick(n => n + 1))
     const id = setInterval(() => tick((n) => n + 1), 250)
-    return () => clearInterval(id)
+    return () => { clearInterval(id); unsubscribe() }
   }, [open])
 
   if (!open) return null
@@ -86,6 +89,8 @@ export function Diagnostics() {
   const v = (w.__voice ?? {}) as Partial<VoiceDiag>
   const t = (w.__tts ?? {}) as Partial<TtsDiag>
   const bridge = bridgeReadiness()
+  const timings = timingDurations()
+  const ms = (value: number | null) => value === null ? '—' : `${value} ms`
 
   // The two verdicts worth stating outright, rather than making you infer them
   // from the numbers underneath.
@@ -110,7 +115,11 @@ export function Diagnostics() {
       <Row k="AI" v={bridge ? `${bridge.ai.configuration} · ${bridge.ai.readiness}` : 'unknown'} />
       <Row k="speech" v={bridge ? `${bridge.speech.stt} · ${bridge.speech.readiness}` : 'unknown'} />
       <Row k="browser / MCP" v={bridge ? `${bridge.browser} / ${bridge.mcp}` : 'unknown'} />
-      <div className="diag-sec">LISTENING</div>
+      <div className="diag-sec">LATEST INTERACTION · {timingSnapshot().status}</div>
+      <Row k="wake → listen" v={ms(timings.wakeToListen)} /><Row k="STT" v={ms(timings.stt)} />
+      <Row k="AI first token" v={ms(timings.firstToken)} /><Row k="TTS after token" v={ms(timings.ttsAudio)} />
+      <Row k="turn complete" v={ms(timings.total)} /><Row k="graphics" v="ECO · DPR 1 · active ~30 FPS · idle/hidden paused" />
+      <div className="diag-sec">LISTENING</div><Row k="wake engine" v={v.wakeEngine ?? 'browser fallback'} />
       <Row k="recogniser" v={v.running ? 'running' : 'STOPPED'} bad={!v.running} />
       <Row k="sessions" v={String(v.sessions ?? 0)} />
       <Row

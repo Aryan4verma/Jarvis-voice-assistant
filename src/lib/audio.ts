@@ -9,24 +9,40 @@ let ctx: AudioContext | null = null
 let analyser: AnalyserNode | null = null
 let buf: Uint8Array | null = null
 
+let opening: Promise<MediaStream> | null = null
+let generation = 0
 export async function getMic(): Promise<MediaStream> {
-  if (stream) return stream
-  stream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-    },
+  if (stream?.getAudioTracks().some(track => track.readyState === 'live')) return stream
+  if (opening) return opening
+  const epoch = generation
+  const pending = navigator.mediaDevices.getUserMedia({ audio: {
+    echoCancellation: true, noiseSuppression: true, autoGainControl: true,
+  } }).then(value => {
+    if (epoch !== generation) { value.getTracks().forEach(track => track.stop()); throw new Error('Microphone initialization cancelled.') }
+    stream = value; return value
   })
-  return stream
+  opening = pending
+  try { return await pending } finally { if (opening === pending) opening = null }
+}
+/** Shared input context; the browser resamples the mic for the wake engine. */
+export function inputContext(): AudioContext {
+  if (!ctx) { try { ctx = new AudioContext({ sampleRate: 16000 }) } catch { ctx = new AudioContext() } }
+  if (ctx.state === 'suspended') void ctx.resume().catch(() => {})
+  return ctx
+}
+export function stopAudio() {
+  generation++; opening = null
+  stream?.getTracks().forEach(track => track.stop()); stream = null
+  if (ctx) void ctx.close().catch(() => {})
+  ctx = null; analyser = null; buf = null
 }
 
 export async function startAnalyser(): Promise<void> {
   if (analyser) return
   const s = await getMic()
-  ctx = new AudioContext()
-  const src = ctx.createMediaStreamSource(s)
-  analyser = ctx.createAnalyser()
+  const c = inputContext()
+  const src = c.createMediaStreamSource(s)
+  analyser = c.createAnalyser()
   analyser.fftSize = 512
   analyser.smoothingTimeConstant = 0.75
   src.connect(analyser)

@@ -3,19 +3,56 @@ import { abortable } from '../abort.mjs'
 
 const BASE = 'https://openrouter.ai/api/v1'
 export const validModelId = id => typeof id === 'string' && id.length <= 192 && /^[a-zA-Z0-9][a-zA-Z0-9._:-]*\/[a-zA-Z0-9._:/-]+$/.test(id)
+export function retryAfter(value, now = Date.now()) {
+  if (typeof value !== 'string' || !value.trim()) return undefined
+  const seconds = /^\d+(?:\.\d+)?$/.test(value.trim()) ? Number(value) : (Date.parse(value) - now) / 1000
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.min(86400, Math.ceil(seconds)) : undefined
+}
 export function routerError(error) {
   const status = Number(error?.status ?? error?.code)
   const code = typeof error?.code === 'string' ? error.code : ''
-  let category = 'unknown'
+  const source = error?.metadata?.limit_source
+  const upstream = typeof error?.metadata?.provider_name === 'string' || source === 'upstream_provider_shared_pool'
+  const free = error?.modelId?.endsWith(':free')
+  const wait = retryAfter(error?.retryAfter)
+  const hint = wait !== undefined ? ` Wait ${wait} seconds before trying again.` : ' Try again later.'
+  let category = 'unknown', message
   if (error?.name === 'AbortError') category = 'cancelled'
   else if (error?.name === 'TimeoutError' || [408,504].includes(status)) category = 'timeout'
-  else if ([401,403].includes(status) || code === 'authentication_error') category = 'authentication'
-  else if (status === 429 || code === 'rate_limit_error') category = 'rate-limit'
-  else if (status === 404 || code === 'model_not_found') category = 'model-unavailable'
-  else if (status === 402 || status >= 500 || code === 'server_error') category = 'unavailable'
-  else if ([400,422].includes(status)) category = 'invalid-request'
+  else if ([401,403].includes(status) || code === 'authentication_error') {
+    category = 'authentication'; message = 'OpenRouter rejected the API key or account permissions. Test or replace the key in AI Settings.'
+  } else if (status === 429 || code === 'rate_limit_error') {
+    category = 'rate-limit'
+    message = upstream ? `${free ? 'The selected free model’s' : 'The selected model’s'} upstream provider is busy or rate limited.${hint} You can manually select another model; none was switched automatically.`
+      : `OpenRouter request limit reached (HTTP 429).${hint} Check the account’s free-model minute/day quota if applicable.`
+  } else if (status === 404 || code === 'model_not_found') {
+    category = 'model-unavailable'; message = 'This model is no longer available. Refresh models and select a model in AI Settings.'
+  } else if (status === 402) {
+    category = 'unavailable'
+    message = source === 'openrouter_in_flight_budget' ? `OpenRouter’s temporary in-flight spending budget is full.${hint}`
+      : source === 'openrouter_key_limit' ? 'OpenRouter API-key credit limit exhausted. Check the key’s spending cap.'
+      : 'Insufficient OpenRouter credits or request budget (HTTP 402). Check the balance, key spending limit, or reduce request size.'
+  } else if (status >= 500 || code === 'server_error') {
+    category = 'unavailable'; message = `${free ? 'The selected free model/provider' : 'OpenRouter or the selected provider'} is temporarily unavailable (HTTP ${status || 503}).${hint} No paid fallback was selected.`
+  } else if ([400,422].includes(status)) category = 'invalid-request'
   else if (error instanceof TypeError) category = 'network'
-  return aiError(category, { providerId:'openrouter', status }, status === 402 ? 'OpenRouter credits are unavailable. Check your account balance.' : undefined)
+  return aiError(category, { providerId:'openrouter', status, ...(wait !== undefined ? { retryAfterSeconds: wait } : {}) }, message)
+}
+/** Read only bounded error metadata. Raw messages/account/provider payloads never reach UI or logs. */
+export async function routerFailure(response, signal, modelId) {
+  let error = {}, bytes = 0
+  const reader = response.body?.getReader(), chunks = []
+  const readSignal = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(3000)])
+  try {
+    if (reader) while (true) {
+      const part = await abortable(reader.read(), readSignal)
+      if (part.done) break
+      bytes += part.value.byteLength; if (bytes > 16384) break; chunks.push(Buffer.from(part.value))
+    }
+    if (bytes <= 16384) error = JSON.parse(Buffer.concat(chunks).toString('utf8')).error ?? {}
+  } catch { /* HTTP status remains authoritative if the body cannot be read. */ }
+  finally { if (reader) { void reader.cancel().catch(()=>{}); reader.releaseLock() } }
+  return routerError({ status: response.status, metadata: error?.metadata, retryAfter: response.headers.get('retry-after'), modelId })
 }
 export function routerUsage(usage) {
   return readUsage({inputTokens:usage?.prompt_tokens,outputTokens:usage?.completion_tokens,
@@ -33,7 +70,7 @@ export function routerInfo(model) {
   }}
 }
 export async function readJSON(response, signal, cap = 16 * 1024 * 1024) {
-  if (!response.ok) { void response.body?.cancel().catch(()=>{}); throw new AIProviderError(routerError({status:response.status})) }
+  if (!response.ok) throw new AIProviderError(await routerFailure(response, signal))
   const reader=response.body?.getReader()
   if (!reader) throw new AIProviderError(aiError('unknown',{providerId:'openrouter'}))
   const chunks=[]; let size=0
@@ -83,7 +120,7 @@ export function createRouterClient(fetchImpl = fetch) {
     async testKey(key,signal) {
       signal=AbortSignal.any([...(signal ? [signal] : []),AbortSignal.timeout(15000)])
       const response=await call('/key',{headers:{authorization:`Bearer ${key}`},signal})
-      if(!response.ok) {void response.body?.cancel().catch(()=>{});throw new AIProviderError(routerError({status:response.status}))}
+      if(!response.ok) throw new AIProviderError(await routerFailure(response, signal))
       // The response contains a key label/account data: never return or log it.
       void response.body?.cancel().catch(()=>{})
     },
@@ -92,8 +129,8 @@ export function createRouterClient(fetchImpl = fetch) {
 }
 
 /** Incremental SSE framing, including fragmented UTF-8, CRLF, comments and multiline data. */
-export async function* routerFrames(response, signal) {
-  if(!response.ok) {void response.body?.cancel().catch(()=>{});throw new AIProviderError(routerError({status:response.status}))}
+export async function* routerFrames(response, signal, modelId) {
+  if(!response.ok) throw new AIProviderError(await routerFailure(response, signal, modelId))
   if(!response.body) throw new AIProviderError(aiError('unknown',{providerId:'openrouter'}))
   const reader=response.body.getReader(), decoder=new TextDecoder()
   let buffer='', ended=false

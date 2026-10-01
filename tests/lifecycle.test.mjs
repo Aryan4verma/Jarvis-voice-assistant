@@ -168,8 +168,8 @@ const voiceHandlers = (seen) => ({ mode: () => 'wake', onWake: (text) => seen.pu
 test('cancelled STT generations drop queued audio and quarantine a late transcript', async () => {
   globalThis.__speech.stt = true
   const seen = [], requests = [], work = deferred()
-  fetchWork = async (_url, init) => { requests.push(init.signal); return work.promise }
-  const voice = await startVoice(voiceHandlers(seen)), vad = globalThis.__vad
+  fetchWork = async (url, init) => { if (!url.endsWith('/stt')) return Response.json({picovoice:false}); requests.push(init.signal); return work.promise }
+  const voice = await startVoice({ ...voiceHandlers(seen), mode: () => 'command', onPartial() {} }), vad = globalThis.__vad
   try {
     vad.onStart(); vad.onEnd(new Blob(['segment']))
     await flush(); assert.equal(requests.length, 1)
@@ -177,11 +177,11 @@ test('cancelled STT generations drop queued audio and quarantine a late transcri
     voice.reset(); assert.equal(requests[0].aborted, true)
     work.resolve(Response.json({text:'Jarvis stale command'})); await flush()
     assert.deepEqual(seen, []); assert.equal(requests.length, 1)
-    fetchWork = async (_url, init) => { requests.push(init.signal); return Response.json({text:'Jarvis fresh command'}) }
+    fetchWork = async (url, init) => { if (!url.endsWith('/stt')) return Response.json({picovoice:false}); requests.push(init.signal); return Response.json({text:'fresh command.'}) }
     vad.onStart(); vad.onEnd(new Blob(['new segment'])); await flush()
-    assert.deepEqual(seen, ['fresh command']); assert.equal(requests.length, 2)
+    assert.deepEqual(seen, ['fresh command.']); assert.equal(requests.length, 2)
     voice.stop(); vad.onError('late capture error'); vad.onLevel(1)
-    assert.deepEqual(seen, ['fresh command'])
+    assert.deepEqual(seen, ['fresh command.'])
   } finally { voice.stop() }
 })
 

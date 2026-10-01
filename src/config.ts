@@ -112,23 +112,4 @@ export const KOKORO_VOICE = choice(
   'bm_george',
 )
 
-export const env = {
-  elevenKey: str(import.meta.env.VITE_ELEVENLABS_API_KEY) ?? '',
-  elevenVoiceId:
-    str(import.meta.env.VITE_ELEVENLABS_VOICE_ID) ?? 'JBFqnCBsd6RMkjVDRZzb',
-  porcupineKey: str(import.meta.env.VITE_PICOVOICE_ACCESS_KEY) ?? '',
-}
-
 export const AI_SELECTION: AISelection = Object.freeze({ transport: 'bridge' })
-
-/**
- * Wake-word engine.
- *   'speech'    — zero setup, uses the browser's SpeechRecognition to listen for
- *                 "hey jarvis". Chrome/Edge only, audio goes to Google.
- *   'porcupine' — recommended. Runs offline in WASM, "Jarvis" is a built-in
- *                 keyword, far fewer false triggers. Needs a free AccessKey
- *                 from console.picovoice.ai.
- */
-export const WAKE_ENGINE: 'speech' | 'porcupine' = env.porcupineKey
-  ? 'porcupine'
-  : 'speech'

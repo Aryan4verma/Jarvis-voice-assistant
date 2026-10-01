@@ -1,5 +1,4 @@
 import {
-  env,
   USE_ELEVENLABS,
   BACKEND,
   TTS_ENGINE,
@@ -185,7 +184,7 @@ function score(v: SpeechSynthesisVoice): number {
   // without leaving the machine.
   if (n.startsWith('daniel')) s += 100
   else if (n.includes('google uk english male')) s += 85
-  else if (/\b(oliver|arthur|jamie|malcolm)\b/.test(n)) s += 80
+  else if (/\b(oliver|arthur|jamie|malcolm|david|mark|george)\b/.test(n)) s += 80
   // Newer macOS en-GB male voices — casual, but serviceable.
   else if (/\b(reed|rocko|eddy)\b/.test(n)) s += 40
 
@@ -248,7 +247,7 @@ function pickVoice(): SpeechSynthesisVoice | null {
  *  always naming a speechSynthesis voice that a cloud or neural engine has
  *  quietly replaced. */
 export function currentVoiceName(): string {
-  if (USE_ELEVENLABS || caps().tts) return 'ElevenLabs'
+  if (USE_ELEVENLABS && caps().tts) return 'ElevenLabs'
   if (TTS_ENGINE === 'kokoro' && !kokoro.isUnavailable()) {
     return KOKORO_VOICE.replace(/^bm_/, '')
   }
@@ -339,7 +338,9 @@ type Item = {
   audio?: Promise<string | null> | null
 }
 
-export function createSpeaker(turn?: Turn): Speaker {
+export function createSpeaker(turn?: Turn, onFirstAudio?: () => void, onFailure?: () => void): Speaker {
+  let firstAudio = false
+  const audioStarted = () => { if (!firstAudio && !turn?.signal.aborted) { firstAudio = true; onFirstAudio?.() } }
   const owner = Symbol(turn?.turnId ?? 'auxiliary speech')
   const controller = new AbortController()
   let finishPlayback: (() => void) | null = null
@@ -382,12 +383,11 @@ export function createSpeaker(turn?: Turn): Speaker {
 
   /** null means "no audio pipeline, use the system voice directly". */
   function synthesise(text: string): Promise<string | null> | null {
-    // Prefer the ElevenLabs voice whenever the bridge reports it is available —
-    // for a demo the timbre is worth the round trip, and this is what makes the
-    // premium path automatic with no flag to set. It falls back to the browser
-    // voice on any failure, so a student without a key still hears him speak.
+    // Cloud speech is opt-in or a rescue for proven native failure, and only
+    // when the authenticated bridge reports a configured speech key. System
+    // speech remains the lightweight default and the fallback for cloud failure.
     // `nativeBroken` latches on once the system voice has proved unusable.
-    if (USE_ELEVENLABS || caps().tts || nativeBroken) {
+    if ((USE_ELEVENLABS || nativeBroken) && caps().tts) {
       // Recorded at the moment the tier is chosen rather than only when the
       // native voice latches over. Without this the panel reported 'system'
       // for a session that had spoken every one of its sentences through
@@ -458,6 +458,7 @@ export function createSpeaker(turn?: Turn): Speaker {
       // proxy — which already holds an ElevenLabs key borrowed from the MCP
       // config. Losing the better timbre is a far smaller failure than a
       // assistant that answers in silence.
+      if (!caps().tts) { onFailure?.(); return }
       if (!nativeBroken) {
         nativeBroken = true
         diag.nativeBroken = true
@@ -544,6 +545,7 @@ export function createSpeaker(turn?: Turn): Speaker {
         if (done || cancelled || nativeOwner !== owner) return
         started = true
         diag.started++
+        audioStarted()
         diag.lastError = ''
         if (watchdog) clearTimeout(watchdog)
         // Chrome stops speaking after roughly fifteen seconds unless the engine
@@ -590,7 +592,7 @@ export function createSpeaker(turn?: Turn): Speaker {
         }
         watchdog = setTimeout(() => {
           if (done || started) return
-          console.error('[jarvis] speech engine is not responding — switching to the cloud voice')
+          console.error('[jarvis] system speech did not start')
           diag.failures++
           diag.lastError = diag.lastError || 'no-start'
           finish()
@@ -666,6 +668,7 @@ export function createSpeaker(turn?: Turn): Speaker {
       audio.onplaying = () => {
         if (done || cancelled) return
         diag.started++
+        audioStarted()
         diag.lastError = ''
       }
       audio.onended = finish
@@ -780,8 +783,8 @@ export function createSpeaker(turn?: Turn): Speaker {
   return speaker
 }
 
-/** Only used when USE_ELEVENLABS is on. Bridge proxy first (it already holds
- *  the key), then a direct key, then null to fall back to the native voice. */
+/** Only used when USE_ELEVENLABS is on. Only the authenticated bridge holds
+ *  the key. Failures fall back to the native voice. */
 async function fetchCloudAudio(text: string, signal: AbortSignal, turnId?: string): Promise<string | null> {
   if (signal.aborted) return null
   if (BACKEND === 'bridge') {
@@ -798,34 +801,6 @@ async function fetchCloudAudio(text: string, signal: AbortSignal, turnId?: strin
     }
   }
 
-  if (env.elevenKey && !signal.aborted) {
-    try {
-      const res = await fetch(
-        `https://api.elevenlabs.io/v1/text-to-speech/${env.elevenVoiceId}/stream` +
-          `?output_format=mp3_22050_32&optimize_streaming_latency=3`,
-        {
-          method: 'POST',
-          signal,
-          headers: {
-            'xi-api-key': env.elevenKey,
-            'content-type': 'application/json',
-          },
-          body: JSON.stringify({
-            text,
-            model_id: 'eleven_flash_v2_5',
-            voice_settings: {
-              stability: 0.4,
-              similarity_boost: 0.75,
-              speed: 1.05,
-            },
-          }),
-        },
-      )
-      if (res.ok) return URL.createObjectURL(await res.blob())
-    } catch {
-      /* fall through */
-    }
-  }
 
   return null
 }

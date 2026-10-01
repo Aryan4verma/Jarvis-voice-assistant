@@ -3,7 +3,8 @@
 Run `npm start`, then open the local JARVIS page. Typed chat works immediately,
 without microphone permission or the voice boot sequence. Enter sends; STOP or
 Escape cancels generation. Voice uses the same brain and turn owner. Typed
-responses are displayed silently; voice responses keep sentence-streamed speech.
+responses use sentence-streamed system speech by default, as do voice responses.
+Voice Settings → Voice Replies selects Always (default), Voice requests only, or Off.
 
 Open **AI Settings**:
 

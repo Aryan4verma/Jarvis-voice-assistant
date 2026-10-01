@@ -1,4 +1,4 @@
-import { getMic } from './audio'
+import { getMic, inputContext } from './audio'
 
 /**
  * Voice-activity detection and segment capture.
@@ -43,6 +43,8 @@ export type Vad = {
   /** Raise the trigger bar while JARVIS speaks, so his own playback leaking
    *  past echo cancellation does not register as the user talking. */
   setGuard: (on: boolean) => void
+  setEnabled: (on: boolean) => void
+  reset: () => void
   live: () => boolean
   /** Live internals, for the diagnostics panel. */
   meter: () => { energy: number; floor: number; threshold: number; speaking: boolean }
@@ -75,7 +77,7 @@ const START_MS = 110
  * should always have been — a cheap "have they stopped making noise" — and the
  * shorter window gets the transcript moving sooner.
  */
-const SILENCE_MS = 650
+export const SILENCE_MS = 400
 /** Nobody speaks one segment for this long; cut it and transcribe what we have. */
 const MAX_MS = 20000
 
@@ -109,19 +111,19 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
         ? 'Microphone access denied — voice input is unavailable.'
         : 'No microphone available.',
     )
-    return { stop: () => {}, setGuard: () => {}, live: () => false, meter: () => ({ energy: 0, floor: 0, threshold: 0, speaking: false }) }
+    return { stop: () => {}, setGuard: () => {}, setEnabled: () => {}, reset: () => {}, live: () => false, meter: () => ({ energy: 0, floor: 0, threshold: 0, speaking: false }) }
   }
 
   if (typeof MediaRecorder === 'undefined') {
     h.onError('This browser cannot record audio — voice input is unavailable.')
-    return { stop: () => {}, setGuard: () => {}, live: () => false, meter: () => ({ energy: 0, floor: 0, threshold: 0, speaking: false }) }
+    return { stop: () => {}, setGuard: () => {}, setEnabled: () => {}, reset: () => {}, live: () => false, meter: () => ({ energy: 0, floor: 0, threshold: 0, speaking: false }) }
   }
 
   const mime = pickMime()
-  const ctx = new AudioContext()
+  const ctx = inputContext()
   // Some browsers start an AudioContext suspended even after a gesture; resume
   // is a no-op when it is already running.
-  void ctx.resume()
+  void ctx.resume().catch(() => {})
   const source = ctx.createMediaStreamSource(stream)
   const analyser = ctx.createAnalyser()
   analyser.fftSize = 1024
@@ -130,6 +132,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   const buf = new Float32Array(analyser.fftSize)
 
   let stopped = false
+  let enabled = true
+  let captureGeneration = 0
   let guard = false
   let floor = 0.01
   let smoothEnergy = 0
@@ -153,13 +157,14 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
 
   const startRecorder = () => {
     parts = []
+    const segmentParts = parts
     try {
       recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream)
     } catch {
       recorder = new MediaRecorder(stream)
     }
     recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size) parts.push(e.data)
+      if (e.data && e.data.size) segmentParts.push(e.data)
     }
     recorder.start()
   }
@@ -179,6 +184,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   const endSegment = () => {
     const rec = recorder
     const startedAt = speechStartedAt
+    const segmentParts = parts, captured = captureGeneration
+    parts = []
     speaking = false
     speechStartedAt = 0
     if (!rec) return
@@ -186,8 +193,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
 
     const finalise = () => {
       const type = rec.mimeType || mime || 'audio/webm'
-      const blob = new Blob(parts, { type })
-      parts = []
+      const blob = new Blob(segmentParts, { type })
+      if (stopped || !enabled || captured !== captureGeneration) return
       const ms = startedAt ? performance.now() - startedAt : 0
       h.onEnd(blob, ms)
     }
@@ -202,7 +209,8 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
 
   const tick = () => {
     if (stopped) return
-    raf = requestAnimationFrame(tick)
+    if (!enabled) return
+    raf = window.setTimeout(tick, 25)
 
     const energy = rms()
     smoothEnergy += (energy - smoothEnergy) * 0.5
@@ -226,7 +234,10 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
           // before we have even confirmed this is speech. If it turns out to be
           // a blip, the recorder is discarded and nothing was lost.
           armedAt = now
-          startRecorder()
+          try { startRecorder() } catch {
+            stopped = true; clearTimeout(raf); discardRecorder(); source.disconnect()
+            h.onError('Audio recording could not start. Try Enable voice again or use typed chat.'); return
+          }
         } else if (now - armedAt >= START_MS) {
           // Confirmed. This is the moment barge-in fires.
           speaking = true
@@ -255,14 +266,21 @@ export async function startVad(h: VadHandlers): Promise<Vad> {
   return {
     stop: () => {
       stopped = true
-      cancelAnimationFrame(raf)
+      clearTimeout(raf)
       discardRecorder()
       try {
         source.disconnect()
-        void ctx.close()
+        analyser.disconnect()
       } catch {
         /* noop */
       }
+    },
+    reset: () => { captureGeneration++; discardRecorder(); speaking = false; speechStartedAt = armedAt = 0 },
+    setEnabled: (on) => {
+      if (enabled === on || stopped) return
+      enabled = on; captureGeneration++; clearTimeout(raf)
+      discardRecorder(); speaking = false; speechStartedAt = armedAt = 0
+      if (enabled) tick()
     },
     setGuard: (on) => {
       guard = on

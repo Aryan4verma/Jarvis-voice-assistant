@@ -1,13 +1,7 @@
-import { useMemo } from 'react'
-import { Canvas, useFrame } from '@react-three/fiber'
-import {
-  EffectComposer,
-  Bloom,
-  ChromaticAberration,
-  Vignette,
-  Noise,
-} from '@react-three/postprocessing'
-import { BlendFunction } from 'postprocessing'
+import { useEffect, useMemo, useState } from 'react'
+import { Canvas, useFrame, useThree } from '@react-three/fiber'
+import { EffectComposer, Bloom } from '@react-three/postprocessing'
+import { ECO, shouldAnimate } from '../lib/graphics'
 import * as THREE from 'three'
 import { Core } from './Core'
 import { Particles } from './Particles'
@@ -192,49 +186,44 @@ function Rig() {
   )
 }
 
+/** Demand rendering: one initial settling burst, then only active 30 Hz or UI changes. */
+function RenderPolicy({ onReady }: { onReady: () => void }) {
+  const { invalidate, setFrameloop } = useThree()
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | null = null, settling = 15
+    const frame = () => {
+      timer = null
+      if (document.hidden) { setFrameloop('never'); return }
+      setFrameloop('demand'); invalidate()
+      if (settling > 0) { settling--; if (settling === 0) onReady() }
+      if (settling || shouldAnimate(useStore.getState().phase, false)) timer = setTimeout(frame, ECO.frameMs)
+    }
+    const sync = () => { if (timer) clearTimeout(timer); frame() }
+    const unsubscribe = useStore.subscribe((next, old) => {
+      if (next.phase !== old.phase || next.ui !== old.ui) { settling = Math.max(settling, 15); sync() }
+    })
+    document.addEventListener('visibilitychange', sync); frame()
+    return () => { if (timer) clearTimeout(timer); unsubscribe(); document.removeEventListener('visibilitychange', sync) }
+  }, [invalidate, setFrameloop, onReady])
+  return null
+}
 export function Scene() {
-  return (
-    <Canvas
-      className="scene"
-      camera={{ position: [0, 0, 6.2], fov: 45 }}
-      gl={{ antialias: true, alpha: true }}
-      dpr={[1, 2]}
-    >
-      <Rig />
-      {/*
-        multisampling={0} on purpose. The default is 8, which allocates a
-        half-float MSAA target — at dpr 2 that is a 3200x1800 buffer — and there
-        is not one polygon edge in this scene for it to smooth: everything is
-        additive blobs, point sprites and lines, all of which are already
-        soft-edged by their own falloff and then blurred again by bloom.
-
-        Tone mapping is also deliberate, if less obviously so. EffectComposer
-        forces gl.toneMapping to NoToneMapping while it is mounted (there is no
-        prop for it), so the additive output clips instead of rolling off. That
-        hard clip to white is the neon look this piece wants — the sweep and the
-        rim are meant to blow out. If you ever want the filmic roll-off back,
-        add a <ToneMapping mode={ToneMappingMode.ACES_FILMIC} /> effect at the
-        end of this chain rather than touching the renderer.
-      */}
+  const [ready, setReady] = useState(false), [lost, setLost] = useState(false)
+  const onReady = useMemo(() => () => setReady(true), [])
+  if (lost) return <div className="scene-standby"><span /><small>3D paused after graphics context loss · chat remains available</small></div>
+  return <div className="scene-shell" data-ready={ready}>
+    {!ready && <div className="scene-standby" aria-hidden="true"><span /></div>}
+    <Canvas className="scene" style={{ opacity: ready ? 1 : 0 }} frameloop="demand"
+      camera={{ position: [0, 0, 6.2], fov: 45 }} dpr={ECO.dpr}
+      gl={{ antialias: false, alpha: false, powerPreference: 'low-power' }}
+      onCreated={({ gl, scene }) => {
+        gl.setClearColor(ECO.background, 1); scene.background = new THREE.Color(ECO.background)
+        gl.domElement.addEventListener('webglcontextlost', event => { event.preventDefault(); setLost(true) }, { once: true })
+      }}>
+      <RenderPolicy onReady={onReady} /><Rig />
       <EffectComposer multisampling={0}>
-        {/* Bloom is what turns additive lines into "hologram". */}
-        <Bloom
-          intensity={1.15}
-          // A higher threshold keeps the mid-tones intact so the orb doesn't
-          // flatten into a solid white disc.
-          luminanceThreshold={0.22}
-          luminanceSmoothing={0.85}
-          mipmapBlur
-          radius={0.72}
-        />
-        <ChromaticAberration
-          offset={new THREE.Vector2(0.0009, 0.0012)}
-          radialModulation={false}
-          modulationOffset={0}
-        />
-        <Noise opacity={0.035} blendFunction={BlendFunction.OVERLAY} />
-        <Vignette eskil={false} offset={0.22} darkness={0.95} />
+        <Bloom luminancePass-resolution-scale={0.5} mipmapBlurPass-resolution-scale={0.5} levels={5} intensity={0.85} luminanceThreshold={0.3} luminanceSmoothing={0.85} mipmapBlur radius={0.65} />
       </EffectComposer>
     </Canvas>
-  )
+  </div>
 }

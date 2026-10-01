@@ -27,6 +27,7 @@ import { createSecretStore } from './secrets.mjs'
 import { createRouterClient } from './providers/openrouter-client.mjs'
 import { createAISettings } from './ai-settings.mjs'
 import { settingsHTTP } from './settings-http.mjs'
+import { voiceHTTP } from './voice-settings.mjs'
 import { functionTools } from './functions.mjs'
 import { createTurnScope } from './turn.mjs'
 import { homedir } from 'node:os'
@@ -144,6 +145,7 @@ const MODEL = process.env.JARVIS_MODEL ?? 'claude-opus-5'
  */
 const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
 const secrets = createSecretStore()
+const voiceSecrets = { elevenlabs: createSecretStore({ purpose: 'elevenlabs', cache: true }), picovoice: createSecretStore({ purpose: 'picovoice' }) }
 const routerClient = createRouterClient()
 const aiSettings = await createAISettings({ secrets, client: routerClient, claudeModel: MODEL })
 
@@ -713,8 +715,9 @@ const handleRequest = async (req, res) => {
     return res.end('body too large')
   }
   if (await settingsHTTP(req, res, { settings: aiSettings, client: routerClient, signal: requestAbort.signal, cors, originAllowed })) return
+  if (await voiceHTTP(req, res, { stores: voiceSecrets, legacyEleven: elevenKey, signal: requestAbort.signal, cors, originAllowed })) return
   if (req.method === 'GET' && route === '/readiness') {
-    const speech = elevenKey() ? 'configured' : 'not-configured'
+    const speech = (await voiceSecrets.elevenlabs.configured() || elevenKey()) ? 'configured' : 'not-configured'
     res.writeHead(200, { ...cors, 'content-type': 'application/json', 'cache-control': 'no-store' })
     return res.end(JSON.stringify({
       ok: true,
@@ -841,7 +844,9 @@ const handleRequest = async (req, res) => {
   }
 
   if (req.method === 'POST' && req.url === '/tts') {
-    const key = elevenKey()
+    let key
+    try { key = await voiceSecrets.elevenlabs.configured() ? await voiceSecrets.elevenlabs.read(requestAbort.signal) : elevenKey() }
+    catch { res.writeHead(503, cors); return res.end('Protected speech key could not be unlocked.') }
     if (!key) {
       res.writeHead(503, cors)
       return res.end('no elevenlabs key')
@@ -932,7 +937,9 @@ const handleRequest = async (req, res) => {
   // speaking at all is done locally with voice-activity detection, which never
   // touches this endpoint; this is only for the words.
   if (req.method === 'POST' && req.url === '/stt') {
-    const key = elevenKey()
+    let key
+    try { key = await voiceSecrets.elevenlabs.configured() ? await voiceSecrets.elevenlabs.read(requestAbort.signal) : elevenKey() }
+    catch { res.writeHead(503, cors); return res.end('Protected speech key could not be unlocked.') }
     if (!key) {
       res.writeHead(503, cors)
       return res.end('no elevenlabs key')
@@ -1052,9 +1059,9 @@ server.listen(PORT, '127.0.0.1', () => {
   try { security.publish() } catch (err) { console.error('[jarvis] private session setup failed:', errorLabel(err)); process.exit(1) }
   console.log(`[jarvis] bridge listening on ws://127.0.0.1:${PORT}`)
 })
-console.log(
-  `[jarvis] speech ${elevenKey() ? 'via ElevenLabs (key from MCP config)' : 'using browser fallback voice'}`,
-)
+void voiceSecrets.elevenlabs.configured().then(configured => {
+  console.log(`[jarvis] speech ${configured || elevenKey() ? 'Scribe configured; system TTS default (cloud voice opt-in)' : 'browser recognition and system voice'}`)
+}).catch(() => console.log('[jarvis] speech protected storage unavailable; browser fallback remains available'))
 console.log(`[jarvis] model ${/^claude-[a-z0-9._-]{1,80}(?:\[[a-z0-9]+\])?$/.test(MODEL) ? MODEL : 'configured'} · effort ${['low', 'medium', 'high', 'xhigh', 'max'].includes(EFFORT) ? EFFORT : 'configured'}`)
 console.log(
   `[jarvis] writes ${ALLOW_WRITES ? 'ENABLED' : 'disabled'}` +
@@ -1216,6 +1223,7 @@ const shutdown = () => {
   stopping = true
   for (const request of httpRequests) request.abort()
   httpRequests.clear()
+  voiceSecrets.elevenlabs.clearCache(); voiceSecrets.picovoice.clearCache()
   for (const disconnect of connections) disconnect()
   for (const socket of wss.clients) socket.close(1001, 'bridge shutdown')
   const deadline = setTimeout(() => process.exit(0), 1000)

@@ -1916,3 +1916,10 @@ kbd {
 .ai-settings small { color: #b0c5ce; }
 .ai-actions { flex-wrap: wrap; margin: 14px 0; }
 @media (max-width: 540px) { .chat-controls { flex-wrap: wrap; } .chat-controls label { flex-basis: 100%; } }
+
+/* ECO fallback covers first paint and shader initialization with the same opaque background. */
+.scene-shell, .scene-standby { position: fixed; inset: 0; background: #01060c; z-index: 1; }
+.scene-standby { display: grid; place-items: center; pointer-events: none; }
+.scene-standby span { width: 22vmin; aspect-ratio: 1; border: 1px solid #00a5ba; border-radius: 50%; box-shadow: 0 0 28px #00b8d033, inset 0 0 24px #00b8d022; }
+.scene-shell .scene { transition: opacity 180ms ease; background: #01060c; }
+.graphics-note, .scene-standby small { position: fixed; top: 65px; left: 30px; color: #7fb6bf; z-index: 4; }

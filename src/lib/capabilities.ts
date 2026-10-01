@@ -1,4 +1,4 @@
-import { BACKEND, BRIDGE_HTTP_URL, env } from '../config'
+import { BACKEND, BRIDGE_HTTP_URL } from '../config'
 import { bridgeFetch } from './bridgeSession'
 
 /**
@@ -55,6 +55,7 @@ export function capabilitiesProbed(): boolean {
  * place, which is the correct behaviour when the bridge is unreachable.
  */
 export async function probeCapabilities(): Promise<Capabilities> {
+  current = { stt: false, tts: false }
   if (BACKEND !== 'bridge') {
     // No bridge to ask. Direct mode has no server-side speech, so browser only.
     current = { stt: false, tts: false }
@@ -82,7 +83,5 @@ export function engineLabel(): string {
   const c = current
   if (c.stt && c.tts) return 'ElevenLabs'
   if (c.tts) return 'ElevenLabs voice'
-  // env.elevenKey is only meaningful in direct mode; harmless to mention.
-  if (env.elevenKey && BACKEND !== 'bridge') return 'ElevenLabs (direct)'
   return 'browser speech'
 }

@@ -150,28 +150,44 @@ prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
 
 ### The voice pipeline
 
-The loop is designed so that nothing silently dies and barge-in feels natural.
+Space enters listening immediately after initialization, with no greeting. One
+shared microphone uses echo cancellation and noise suppression. There is no
+microphone capture or WebGL scene before you initialize; the cinematic boot no
+longer blocks readiness for 9.2 seconds. Automatic clap ignition and startup
+music are disabled in the ECO baseline; their existing modules remain available.
 
-- **Detection is local.** An energy-based voice-activity detector
-  (`src/lib/vad.ts`) decides when you are speaking. It is instant, cannot quietly
-  fail, and is what makes **barge-in** work — speak while JARVIS is talking and he
-  stops.
-- **Transcription has two tiers, chosen automatically at boot.** The browser asks
-  the authenticated bridge `/readiness` once and selects from its configuration:
-  - **ElevenLabs key present** → ElevenLabs Scribe, via the bridge `/stt` endpoint.
-  - **Nothing configured** → the browser's own `SpeechRecognition` (Chrome/Edge),
-    guarded by a heartbeat so it recovers when Chrome throttles it.
-- **Speaking** uses the **ElevenLabs voice when a key is present**, and the
-  browser's `speechSynthesis` otherwise. If a cloud call fails it falls back to
-  the browser voice, and if the OS voice itself is broken it latches over to the
-  cloud voice.
+**Voice Settings** configures optional ElevenLabs Scribe and Picovoice keys in
+Windows CurrentUser DPAPI storage outside the repository. Scribe transcribes
+commands/interruptions only, never standby room audio. Browser SpeechRecognition
+remains the fallback (its service may send audio to the browser vendor). Modern
+Chrome/Edge can use the shared audio track; older browsers may own internal
+recognition capture. Missing microphone permission keeps typed chat available.
 
-So it works with no keys and auto-upgrades when a key appears — there is no flag
-to set. Capability detection lives in `src/lib/capabilities.ts`, which probes the
-bridge's authenticated `GET /readiness` once at boot and picks the engines.
-Configured speech is not proof of a valid key or a working external service;
-the startup diagnostics label it `not-validated`. Public `/health` reports
-only basic bridge availability.
+Optional Porcupine detects the built-in “Jarvis” keyword locally on one CPU
+thread, then command recognition takes over. Its model downloads once when
+configured and is cached by the SDK. The AccessKey is encrypted at rest but the
+Web SDK necessarily receives it inside its worker at runtime. It is never saved
+in localStorage, source, or configuration. AI/ElevenLabs keys remain backend-only.
+Optional wake setup fails back to browser recognition without blocking startup.
+
+**Voice Replies** defaults to **Always** for both typed and voice requests;
+**Voice requests only** and **Off** are available. Responses stream sentences
+through system speech by default. `VITE_USE_ELEVENLABS=true` opts into cloud TTS;
+otherwise a configured cloud voice is only a rescue for failed native speech.
+Kokoro remains explicitly optional. STOP/Escape cancel the same owned turn,
+including queued audio. Native speech failure is reported instead of silently
+waiting or contacting an unconfigured cloud service.
+
+ECO retains the holographic 3D design with lazy loading, DPR 1, approximately
+30 FPS while active, half-resolution bloom, and no chromatic aberration/noise.
+Standby freezes after a short settling burst; hidden tabs render no frames.
+First paint, shader initialization and graphics failure use an opaque dark
+background. Camera and gestures remain opt-in. Press **D** for event-based
+latest-interaction latency diagnostics; press **T** for an audio-only test.
+
+Readiness describes configuration, not live provider validation. No provider
+API polling, paid fallback, or automatic effectful request replay is added.
+See [VOICE_PERFORMANCE.md](VOICE_PERFORMANCE.md) for details and limitations.
 
 ---
 

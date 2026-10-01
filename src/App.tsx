@@ -1,10 +1,14 @@
 import { useEffect, useRef } from 'react'
-import { Scene } from './scene/Scene'
+import { SceneHost } from './scene/SceneHost'
 import { Hud } from './ui/Hud'
 import { Boot } from './ui/Boot'
 import { Ignition } from './ui/Ignition'
 import { ChatInput } from './ui/ChatInput'
 import { boundedHistory } from './lib/chat'
+import { shouldSpeak } from './lib/voiceSettings'
+import { beginListening, beginTiming, markTiming, cancelTiming, timingSnapshot } from './lib/latency'
+import { enterCommand } from './lib/interaction'
+import { shouldAnimate } from './lib/graphics'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
 import { startVoice, type Voice, type VoiceMode } from './lib/voice'
@@ -12,11 +16,10 @@ import { createSpeaker, cycleVoice, currentVoiceName } from './lib/tts'
 import * as sfx from './lib/sfx'
 import * as music from './lib/music'
 import * as hands from './lib/hands'
-import { listenForClap } from './lib/clap'
 import * as camera from './lib/camera'
 import * as kokoro from './lib/kokoro'
 import { TTS_ENGINE } from './config'
-import { forTool, attention } from './lib/fillers'
+import { forTool } from './lib/fillers'
 import {
   ask,
   warm,
@@ -33,9 +36,9 @@ import {
   configurationIssue,
   type AIMessage,
 } from './lib/brain'
-import { startAnalyser, micLevel } from './lib/audio'
+import { startAnalyser, micLevel, stopAudio } from './lib/audio'
 import { probeCapabilities } from './lib/capabilities'
-import { delay, TurnCancelled, type Turn } from './lib/turn'
+import { TurnCancelled, type Turn } from './lib/turn'
 
 /**
  * The conversation.
@@ -69,7 +72,6 @@ const LEADING_NAME = new RegExp(`^(?:hey|hi|ok|okay|yo)?\\s*${NAME}\\b[\\s,.:!?-
 
 export default function App() {
   const store = useStore
-  const phase = useStore((s) => s.phase)
   const history = useRef<AIMessage[]>([])
   const speaker = useRef<ReturnType<typeof createSpeaker> | null>(null)
   const voice = useRef<Voice | null>(null)
@@ -97,6 +99,7 @@ export default function App() {
   const goDormant = () => {
     clearIdle()
     cancel('stop')
+    cancelTiming()
     voice.current?.reset()
     silence()
     const s = store.getState()
@@ -114,6 +117,7 @@ export default function App() {
     const s = store.getState()
     s.setCaption('')
     s.setPhase('listening')
+    voice.current?.sync?.()
     sfx.play('listen')
     idleTimer.current = setTimeout(goDormant, window)
   }
@@ -122,15 +126,17 @@ export default function App() {
 
   const respond = async (said: string, source: 'voice' | 'typed' = 'voice'): Promise<void> => {
     registerBridgeHandlers()
-    const spoken = source === 'voice'
+    const spoken = shouldSpeak(source)
     silence()
     const mine = turns.begin()
     interaction.current = mine
+    beginTiming(mine.turnId, source)
     const stale = () => !mine.current()
     voice.current?.reset()
     const cancelled = () => {
       if (interaction.current !== mine) return
       interaction.current = null
+      cancelTiming(mine.turnId)
       speaker.current = null // the speaker's own abort listener stops only its audio
       lookingRequest.current = null
       store.getState().setLooking(null)
@@ -142,7 +148,7 @@ export default function App() {
         store.getState().setError(reason === 'timeout'
           ? 'Interaction timed out. Backend termination requested; late output is ignored.'
           : reason === 'disconnect' ? 'Bridge disconnected. This interaction was cancelled.' : mine.signal.reason.message)
-        if (spoken && voice.current) listen(FOLLOW_UP_MS)
+        if (source === 'voice' && voice.current) listen(FOLLOW_UP_MS)
         else store.getState().setPhase('dormant')
       } else if (reason !== 'replaced') {
         store.getState().setPhase('dormant')
@@ -161,7 +167,9 @@ export default function App() {
     s.pushTurn({ id: `${mine.turnId}:user`, role: 'user', text: said })
     s.setPhase('thinking')
 
-    const spk = spoken ? createSpeaker(mine) : null
+    const spk = spoken ? createSpeaker(mine, () => markTiming('ttsAudio', mine.turnId), () => {
+      if (mine.current()) store.getState().setError('System speech could not start. Check browser audio permissions or press T to test. Your text response is still available.')
+    }) : null
     speaker.current = spk
     sfx.duck(true)
     music.duck(true)
@@ -175,6 +183,7 @@ export default function App() {
         onEvent: (event) => {
           if (stale()) return
           if (event.type === 'text') {
+            markTiming('firstToken', mine.turnId)
             const delta = event.delta
             if (!started) {
               started = true
@@ -229,6 +238,7 @@ export default function App() {
     } finally {
       mine.signal.removeEventListener('abort', cancelled)
       if (!stale()) {
+        markTiming('complete', mine.turnId)
         mine.complete()
         if (interaction.current === mine) interaction.current = null
         speaker.current = null
@@ -238,7 +248,7 @@ export default function App() {
         music.working(false)
         // Stay open. Having to say his name again to add one more sentence is
         // the difference between a conversation and a vending machine.
-        if (spoken && voice.current) listen(FOLLOW_UP_MS)
+        if (source === 'voice' && voice.current) listen(FOLLOW_UP_MS)
         else store.getState().setPhase('dormant')
       }
     }
@@ -262,31 +272,17 @@ export default function App() {
     }
   }
 
+  const startListening = (wake = false) => {
+    beginListening(wake)
+    enterCommand({ cancel: () => cancel('replaced'), silence,
+      reset: () => voice.current?.reset(), listen: () => listen(AWAIT_SPEECH_MS) })
+    store.getState().setError(null)
+  }
   const onWake = (trailing: string) => {
     const phase = store.getState().phase
     if (phase === 'offline' || phase === 'boot') return
-
-    store.getState().setError(null)
-    sfx.play('wake')
-
-    // "Jarvis, what's happening in AI this week" in one breath. Waiting for a
-    // greeting he didn't need is the most common way an assistant wastes time.
-    if (trailing) {
-      void respond(trailing)
-      return
-    }
-
-    store.getState().setPhase('waking')
-
-    // Answer to his name. Deliberately NOT awaited any more: the microphone is
-    // already open and the echo filter knows his voice, so the user can talk
-    // straight over the greeting instead of waiting it out.
-    const greeting = createSpeaker()
-    speaker.current = greeting
-    greeting.say(attention())
-    void greeting.end()
-
-    listen(AWAIT_SPEECH_MS)
+    if (trailing) { beginListening(true); void respond(trailing); return }
+    startListening(true)
   }
 
   /**
@@ -311,6 +307,7 @@ export default function App() {
       sfx.duck(false)
       music.duck(false)
     }
+    if (timingSnapshot().status !== 'listening') beginListening()
     store.getState().setPhase('listening')
   }
 
@@ -456,6 +453,7 @@ export default function App() {
     // only moves after the first await — so without this a double press boots
     // twice, arming two voice loops and two download polls.
     if (booting.current) return
+    if (voice.current) { startListening(); return }
     booting.current = true
     const signal = lifetime.current.signal
 
@@ -469,8 +467,8 @@ export default function App() {
       // for the rest of the page, recoverable only by reloading. Reset it and
       // put the button back so the user can simply press it again.
       booting.current = false
-      console.error('[jarvis] power-up failed:', err)
-      store.getState().setPhase('offline')
+      console.warn('[jarvis] optional voice initialization failed')
+      store.getState().setPhase('dormant')
       store
         .getState()
         .setError(
@@ -490,13 +488,12 @@ export default function App() {
     await sfx.unlockAudio()
     signal.throwIfAborted()
     sfx.play('boot')
-    // The score. Must be started from inside this click handler for the same
-    // reason as the rest of the audio.
-    music.enable()
-    music.playBoot()
-    music.startAmbient()
+    // Keep the soundscape opt-in rather than starting a long score over command capture.
+    // Ambient music remains available to tools; ECO startup does not start it.
 
     s.setPhase('boot')
+    // Readiness is independent of the cinematic sequence and optional services.
+    queueMicrotask(() => { if (!signal.aborted && store.getState().phase === 'boot') store.getState().setPhase('dormant') })
 
     registerBridgeHandlers()
     const warming = warm().catch((err: Error) => { if (!signal.aborted) s.setError(err.message) })
@@ -522,34 +519,26 @@ export default function App() {
       }, 200)
     }
 
-    // Long enough for the four-beat start-up sequence in Boot.tsx to play —
-    // status bar, rings, suit schematic, reactor power-up — before the live
-    // interface takes over. Kept a touch under the boot cue so the music is
-    // still rising as the reactor lands.
-    await delay(9200, signal) // boot sequence
-    await warming
+    // Optional bridge warm-up never owns frontend readiness.
+    void warming
     signal.throwIfAborted()
     store.getState().setConnected(connectedLabels())
     store.getState().setVoice(currentVoiceName())
 
-    // The analyser is what makes the reactor pulse with your voice. It needs a
-    // getUserMedia stream; speech recognition does not, and gets its own. So a
-    // failure here costs the animation and nothing else — saying "voice input
-    // is unavailable" was both alarming and untrue.
+    // The analyser and command/wake engines share the same microphone.
+    // Optional readiness checks run concurrently with microphone permission.
+    const probing = probeCapabilities()
     try {
       await startAnalyser()
     } catch {
-      console.warn(
-        '[jarvis] no microphone stream — the reactor will not pulse with your ' +
-          'voice. Speech recognition is unaffected.',
-      )
+      console.warn('[jarvis] microphone unavailable; typed chat remains available')
     }
     signal.throwIfAborted()
 
     // Ask the bridge which speech engines exist before the loop starts, so the
     // first turn already uses ElevenLabs when a key is present and the browser
     // fallback when it is not — no flag, no reload.
-    await probeCapabilities()
+    await probing
     signal.throwIfAborted()
 
     // One voice loop, started once, running until the page closes.
@@ -562,59 +551,33 @@ export default function App() {
       onError: (message) => { if (!signal.aborted) onVoiceError(message) },
     })
     if (signal.aborted) { startedVoice.stop(); return }
-    voice.current = startedVoice
-
-    store.getState().setPhase('dormant')
+    voice.current = startedVoice.live() ? startedVoice : null
+    if (!voice.current) startedVoice.stop()
+    booting.current = false
+    startedVoice.sync?.()
   }
-
-  // -- clap to start --------------------------------------------------------
-
-  /**
-   * A clap brings him up, as an alternative to the button.
-   *
-   * Only while the ignition screen is showing, and torn down the moment he
-   * boots — the microphone is about to belong to the voice loop, and two
-   * analysers arguing over the same stream is how you get an assistant that
-   * hears half of what you say.
-   *
-   * Deliberately silent about failure. If the microphone is refused, or has not
-   * been granted yet, the button is still right there; announcing an error
-   * about a feature nobody asked for would be worse than quietly doing without.
-   */
-  useEffect(() => {
-    if (phase !== 'offline') return
-    let live: { stop: () => void } | null = null
-    let gone = false
-    void listenForClap(() => {
-      if (!gone) void powerOn()
-    }).then((l) => {
-      if (gone) l.stop()
-      else live = l
-    })
-    return () => {
-      gone = true
-      live?.stop()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase])
 
   // -- level pump + keys ----------------------------------------------------
 
   useEffect(() => {
     if (lifetime.current.signal.aborted) lifetime.current = new AbortController()
-    let raf = 0
-
+    let meterTimer: ReturnType<typeof setTimeout> | null = null
     const pump = () => {
+      meterTimer = null
       const st = store.getState()
-      // While speaking, follow JARVIS's own output rather than the mic, so the
-      // orb lip-syncs instead of reacting to room noise.
-      const lvl =
-        st.phase === 'speaking' && speaker.current
-          ? speaker.current.level()
-          : micLevel()
-      st.setLevel(lvl)
-      raf = requestAnimationFrame(pump)
+      if (!shouldAnimate(st.phase, document.hidden)) { if (st.level) st.setLevel(0); return }
+      st.setLevel(st.phase === 'speaking' && speaker.current ? speaker.current.level() : micLevel())
+      meterTimer = setTimeout(pump, 34)
     }
+    const sync = () => {
+      voice.current?.sync?.()
+      if (meterTimer) clearTimeout(meterTimer)
+      pump()
+    }
+    const unsubscribe = store.subscribe((next, previous) => { if (next.phase !== previous.phase) sync() })
+    document.addEventListener('visibilitychange', sync)
+    const preference = (event: Event) => { if ((event as CustomEvent).detail === 'off') silence() }
+    window.addEventListener('jarvis-voice-preference', preference)
     pump()
 
     const onKey = (e: KeyboardEvent) => {
@@ -709,25 +672,19 @@ export default function App() {
       e.preventDefault()
 
       const phase = store.getState().phase
-      if (phase === 'offline') {
-        void powerOn()
-      } else if (phase === 'boot') {
-        /* ignore — the boot sequence owns the phase until it finishes */
-      } else if (
-        phase === 'thinking' ||
-        phase === 'tooling' ||
-        phase === 'speaking'
-      ) {
-        onSpeechStart()
-        listen(AWAIT_SPEECH_MS)
+      if (phase === 'offline' || !voice.current && !booting.current) {
+        void powerOn().then(() => { if (voice.current && !lifetime.current.signal.aborted) startListening() })
       } else {
-        onWake('')
+        startListening()
       }
     }
     window.addEventListener('keydown', onKey)
 
     return () => {
-      cancelAnimationFrame(raf)
+      if (meterTimer) clearTimeout(meterTimer)
+      unsubscribe()
+      document.removeEventListener('visibilitychange', sync)
+      window.removeEventListener('jarvis-voice-preference', preference)
       window.removeEventListener('keydown', onKey)
       lifetime.current.abort()
       channelsReady.current = false
@@ -735,6 +692,7 @@ export default function App() {
       shutdown()
       if (voicePoll.current) clearInterval(voicePoll.current)
       voice.current?.stop()
+      stopAudio()
       speaker.current?.cancel()
       // The camera must not outlive the page that turned it on.
       hands.disableHands()
@@ -744,11 +702,15 @@ export default function App() {
 
   return (
     <>
-      <Scene />
+      <SceneHost />
       <Hud />
       <Boot />
       <Diagnostics />
-      <ChatInput respond={respond} onStop={goDormant} onVoice={() => void powerOn()} />
+      <ChatInput onVoiceChanged={() => {
+        if (!voice.current) return
+        goDormant(); voice.current.stop(); voice.current = null; booting.current = false
+        void powerOn()
+      }} respond={respond} onStop={goDormant} onVoice={() => void powerOn()} />
       <Ignition onStart={() => void powerOn()} />
     </>
   )
