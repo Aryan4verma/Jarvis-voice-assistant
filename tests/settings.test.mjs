@@ -27,8 +27,8 @@ async function temporary(run) {
   }
 }
 const client = {
-  cached: () => null, model: async () => ({ modelId: 'fixture/model' }),
-  testKey: async key => { assert.equal(key, KEY) }, catalog: async () => [],
+  cached: id => id === 'fixture/model' ? { modelId: id } : null, model: async () => ({ modelId: 'fixture/model' }),
+  testKey: async key => { assert.equal(key, KEY) }, catalog: async () => [{ modelId: 'fixture/model' }],
 }
 async function setup(directory, custom = client) {
   const secrets = createSecretStore({ directory: join(directory, 'keys'), crypt: fakeCrypt, supported: true })
@@ -47,7 +47,8 @@ test('protected storage saves/replaces/deletes outside the repository and never 
   assert.equal(publicValue.keyConfigured, true); assert.equal(publicValue.modelId, 'fixture/model')
   assert.ok(!JSON.stringify(publicValue).includes(KEY))
   const config = await readFile(join(directory, 'settings/ai.json'), 'utf8')
-  assert.deepEqual(JSON.parse(config), preferences); assert.ok(!config.includes(KEY))
+  const { profiles: savedProfiles, ...savedActive } = JSON.parse(config)
+  assert.deepEqual(savedActive, preferences); assert.deepEqual(savedProfiles.openrouter, { mode: preferences.mode, models: preferences.models }); assert.ok(!config.includes(KEY))
   await settings.saveKey(KEY + '-replacement'); assert.equal(await secrets.read(), KEY + '-replacement')
   await settings.deleteKey(); assert.equal(await secrets.configured(), false)
   assert.deepEqual(await readdir(join(directory, 'keys')), [])
@@ -95,7 +96,8 @@ test('damaged optional preferences retain a usable Claude fallback and can be re
   assert.equal(settings.selection().providerId, 'claude-agent')
   assert.equal((await settings.snapshot()).readiness, 'unavailable')
   await settings.save(preferences)
-  assert.deepEqual(JSON.parse(await readFile(join(directory, 'settings/ai.json'), 'utf8')), preferences)
+  const { profiles, ...active } = JSON.parse(await readFile(join(directory, 'settings/ai.json'), 'utf8'))
+  assert.deepEqual(active, preferences); assert.deepEqual(profiles.openrouter.models, preferences.models)
   assert.equal((await settings.snapshot()).error, null)
 }))
 
@@ -116,6 +118,11 @@ test('connection failures produce safe status and account/key data never reaches
   await settings.saveKey(KEY); await settings.save(preferences)
   const value = await settings.test(new AbortController().signal)
   assert.equal(value.readiness, 'invalid-credentials'); assert.ok(!JSON.stringify(value).includes(KEY))
+}))
+test('an explicit OpenRouter connection test does not report an absent catalog model ready', async () => temporary(async directory => {
+  const { settings } = await setup(directory); await settings.saveKey(KEY)
+  await settings.save({ ...preferences, models: { ...preferences.models, balanced: 'fixture/missing' } })
+  assert.equal((await settings.test(new AbortController().signal)).readiness, 'model-unavailable')
 }))
 
 test('HTTP settings require mutation Origin/header, reject oversized bodies and never echo saved secrets', async () => temporary(async directory => {

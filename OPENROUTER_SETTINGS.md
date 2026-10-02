@@ -1,5 +1,14 @@
 # OpenRouter and typed chat
 
+Phase 7 adds separate OpenAI/Gemini key slots and per-provider model mappings;
+see [PHASE7.md](PHASE7.md). OpenRouter now offers Free only/Vision/Tools/search
+filters, free-first ordering, and explicit `openrouter/free` selection. FREE
+requires known zero input/output prices with no catalog-reported extra charge;
+unknown pricing and `:free` suffixes alone do not establish free status.
+Load model catalog or Test Connection in Settings to verify capabilities after
+a bridge restart. Inference does not download catalogs; unknown manual IDs
+remain text-only until verified. No automatic paid/provider substitution occurs.
+
 Run `npm start`, then open the local JARVIS page. Typed chat works immediately,
 without microphone permission or the voice boot sequence. Enter sends; STOP or
 Escape cancels generation. Voice uses the same brain and turn owner. Typed

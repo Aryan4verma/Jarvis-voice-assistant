@@ -16,7 +16,7 @@ export async function load(url, context, next) {
     '/src/config.ts': `export const BACKEND='bridge', AI_SELECTION={transport:'bridge'}, BRIDGE_HTTP_URL='/__jarvis/bridge', BRIDGE_WS_URL='ws://localhost:5173/__jarvis/bridge/ws', USE_ELEVENLABS=true, TTS_ENGINE='system', KOKORO_VOICE='test', MODEL='test-model', FAST_MODE=false, SYSTEM_PROMPT='Test', env={elevenKey:''}; export const activeServers=()=>[];`,
     '/src/lib/capabilities.ts': `export const caps=()=>globalThis.__speech;`,
     '/src/lib/kokoro.ts': `export const isUnavailable=()=>true; export const speak=async()=>null;`,
-    '/src/lib/audio.ts': `export const getMic=async()=>({getAudioTracks:()=>[{readyState:"live"}]});`,
+    '/src/lib/audio.ts': `export const getMic=async()=>({getAudioTracks:()=>[{readyState:"live"}]}); export const inputContext=()=>globalThis.__inputContext;`,
     '/src/lib/wake.ts': `export const startWake=async (...args)=>{ if (!globalThis.__wakeDouble) throw new Error('Unavailable'); return globalThis.__wakeDouble(...args) };`,
     '/src/lib/vad.ts': `export const startVad=async(handlers)=>{globalThis.__vad=handlers; return {live:()=>true,stop:()=>{},setGuard:()=>{},meter:()=>({speaking:false})};};`,
   }

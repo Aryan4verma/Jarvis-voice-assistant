@@ -3,9 +3,13 @@ import { bridgeFetch } from './bridgeSession'
 import type { AIError, AIProviderInfo } from './ai'
 
 export type AIMode = 'fast' | 'balanced' | 'deep'
-export type Model = AIProviderInfo & { name: string; inputPrice?: number; outputPrice?: number }
-export type AIPreferences = { providerId: 'claude-agent' | 'openrouter'; mode: AIMode; models: Record<AIMode, string> }
+export type Model = AIProviderInfo & { name: string; inputPrice?: number; outputPrice?: number; free?: boolean }
+export type ProviderId = 'claude-agent' | 'openrouter' | 'openai' | 'gemini'
+export const PROVIDER_NAMES: Record<ProviderId, string> = { 'claude-agent': 'Claude Agent', openrouter: 'OpenRouter', openai: 'OpenAI', gemini: 'Google Gemini' }
+export type AIPreferences = { providerId: ProviderId; mode: AIMode; models: Record<AIMode, string> }
 export type AISettings = AIPreferences & {
+  profiles: Partial<Record<ProviderId, { mode: AIMode; models: Record<AIMode, string> }>>
+  providers: Partial<Record<ProviderId, { configured: boolean; storageSupported: boolean; readiness: string; error: AIError | null }>>
   revision: number; modelId: string; keyConfigured: boolean; storageSupported: boolean
   readiness: string; error: AIError | null; model: Model | null
 }
@@ -45,15 +49,16 @@ async function settingsRequest(path: string, method?: string, body?: unknown, si
 }
 export const getSettings = (signal?: AbortSignal) => settingsRequest('settings', 'GET', undefined, signal)
 export const saveSettings = (value: AIPreferences, signal?: AbortSignal) => settingsRequest('settings', 'PUT', value, signal)
-export const saveKey = (key: string, signal?: AbortSignal) => settingsRequest('key', 'POST', { key }, signal)
-export const deleteKey = (signal?: AbortSignal) => settingsRequest('key', 'DELETE', undefined, signal)
-export const testConnection = (signal?: AbortSignal) => settingsRequest('test', 'POST', undefined, signal)
-export const getModels = async (signal?: AbortSignal): Promise<Model[]> => (await request('models?refresh=1', 'GET', undefined, signal)).models
+export const saveKey = (key: string, signal?: AbortSignal, provider: ProviderId = 'openrouter') => settingsRequest(`key?provider=${provider}`, 'POST', { key }, signal)
+export const deleteKey = (signal?: AbortSignal, provider: ProviderId = 'openrouter') => settingsRequest(`key?provider=${provider}`, 'DELETE', undefined, signal)
+export const testConnection = (signal?: AbortSignal, provider: ProviderId = 'openrouter') => settingsRequest(`test?provider=${provider}`, 'POST', undefined, signal)
+export const getModels = async (signal?: AbortSignal, provider: ProviderId = 'openrouter'): Promise<Model[]> => (await request(`models?provider=${provider}`, 'GET', undefined, signal)).models
 export function readinessLabel(value: AISettings | null) {
   if (!value) return 'AI settings available when the bridge is running'
   if (value.providerId === 'claude-agent') return `Claude Agent · ${value.error?.message || (value.readiness === 'unavailable' ? 'provider unavailable' : `${value.modelId} · validated on request`)}`
-  if (!value.keyConfigured) return 'OpenRouter · key not configured'
-  if (!value.modelId) return 'OpenRouter · choose a model in AI Settings'
-  if (value.error) return `OpenRouter · ${value.error.message}`
-  return `OpenRouter · ${value.mode.toUpperCase()} · ${value.modelId} · ${value.readiness === 'not-validated' ? 'configured, not tested' : value.readiness}`
+  const name = PROVIDER_NAMES[value.providerId]
+  if (!value.keyConfigured) return `${name} · key not configured`
+  if (!value.modelId) return `${name} · choose a model in AI Settings`
+  if (value.error) return `${name} · ${value.error.message}`
+  return `${name} · ${value.mode.toUpperCase()} · ${value.modelId} · ${value.readiness === 'not-validated' ? 'configured, not tested' : value.readiness}`
 }

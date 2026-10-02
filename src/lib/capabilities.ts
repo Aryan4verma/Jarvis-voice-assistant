@@ -55,7 +55,7 @@ export function capabilitiesProbed(): boolean {
  * place, which is the correct behaviour when the bridge is unreachable.
  */
 export async function probeCapabilities(): Promise<Capabilities> {
-  current = { stt: false, tts: false }
+  current = { stt: false, tts: false }; status = null
   if (BACKEND !== 'bridge') {
     // No bridge to ask. Direct mode has no server-side speech, so browser only.
     current = { stt: false, tts: false }

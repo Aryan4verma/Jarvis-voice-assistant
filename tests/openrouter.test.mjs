@@ -22,6 +22,9 @@ function fixture(responses = [response([text('Hello.')])], metadata = model()) {
     if (url.endsWith('/key')) return Response.json({ data: { label: 'private-account-fixture' } })
     return responses.shift()
   })
+  const loaded = client.catalog() // Model capabilities are loaded by Settings, not generation.
+  const modelLookup = client.model.bind(client)
+  client.model = async (...args) => { await loaded; return modelLookup(...args) }
   const adapter = createOpenRouterAdapter({ client, modelId: metadata.id, mode: 'balanced', getKey: async () => 'mock-provider-key-not-real', decideTool: () => true, onInfo: value => infos.push(value) })
   return { adapter, scope, calls, infos, events, client, run: (value = 'Question', runtime) => adapter.start(request(value), { onEvent: event => scope.send(event) }, interaction(scope), runtime) }
 }

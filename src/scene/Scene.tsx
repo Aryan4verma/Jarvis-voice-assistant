@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { EffectComposer, Bloom } from '@react-three/postprocessing'
+import { startupStatus } from '../lib/startup'
 import { ECO, shouldAnimate } from '../lib/graphics'
 import * as THREE from 'three'
 import { Core } from './Core'
@@ -209,7 +210,7 @@ function RenderPolicy({ onReady }: { onReady: () => void }) {
 }
 export function Scene() {
   const [ready, setReady] = useState(false), [lost, setLost] = useState(false)
-  const onReady = useMemo(() => () => setReady(true), [])
+  const onReady = useMemo(() => () => { setReady(true); startupStatus('graphics', 'READY') }, [])
   if (lost) return <div className="scene-standby"><span /><small>3D paused after graphics context loss · chat remains available</small></div>
   return <div className="scene-shell" data-ready={ready}>
     {!ready && <div className="scene-standby" aria-hidden="true"><span /></div>}
@@ -218,7 +219,7 @@ export function Scene() {
       gl={{ antialias: false, alpha: false, powerPreference: 'low-power' }}
       onCreated={({ gl, scene }) => {
         gl.setClearColor(ECO.background, 1); scene.background = new THREE.Color(ECO.background)
-        gl.domElement.addEventListener('webglcontextlost', event => { event.preventDefault(); setLost(true) }, { once: true })
+        gl.domElement.addEventListener('webglcontextlost', event => { event.preventDefault(); startupStatus('graphics', 'UNAVAILABLE'); setLost(true) }, { once: true })
       }}>
       <RenderPolicy onReady={onReady} /><Rig />
       <EffectComposer multisampling={0}>

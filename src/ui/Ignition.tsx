@@ -1,55 +1,35 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useStore } from '../store'
+import { listenForClap, type ClapListener } from '../lib/clap'
+import { inputContext } from '../lib/audio'
+import * as sfx from '../lib/sfx'
 
-/**
- * The start gate.
- *
- * Browsers refuse to play audio or start speech synthesis until the user has
- * interacted with the page, so something has to be clicked before JARVIS can
- * make a sound. Rather than hide that behind a permissions banner, it's the
- * cold open: a dead interface waiting to be switched on.
- *
- * Deliberately NOT wrapped in AnimatePresence, and the reason is worth keeping.
- *
- * It used to be, for the sake of a blur-and-fade on the way out, and the exit
- * never completed — the node reached opacity 0 and then stayed in the DOM for
- * the rest of the session. Which would be a cosmetic non-event, except this is
- * a `position: fixed; inset: 0` button: invisible, unremovable, and the topmost
- * hit-testable thing under every single point on the screen.
- *
- * Everything that aims by hit-testing died on it. Hand control resolves its
- * target with elementFromPoint, so every pinch — focus, grab, drag, close —
- * landed on an invisible button instead of a blade, silently, with no error and
- * nothing on screen to suggest why. It cost an entire evening of looking at the
- * gesture code, which was fine.
- *
- * Two attempted fixes failed and are worth recording so nobody re-attempts
- * them. Giving the child a `key` did not make the exit complete. Adding a
- * phase-dependent `pointerEvents` did not help either, because AnimatePresence
- * renders an exiting child from a frozen snapshot of its last props — inside
- * that copy the phase is forever 'offline', so a guard written in terms of it
- * can never fire.
- *
- * A plain conditional cannot strand anything. The fade-in survives because
- * mounting is not the dangerous direction; the fade-out is gone, and the boot
- * sequence takes the screen immediately anyway, so there is nothing to see.
- */
-export function Ignition({ onStart }: { onStart: () => void }) {
-  const phase = useStore((s) => s.phase)
+export function Ignition({ onStart }: { onStart: (source?: 'manual' | 'clap') => void }) {
+  const phase = useStore(s => s.phase)
+  const start = useRef(onStart); start.current = onStart
+  const pending = useRef(false)
+  const listener = useRef<ClapListener | null>(null), lifetime = useRef(new AbortController())
+  const [status, setStatus] = useState('Click once to authorize double-clap activation. Browser permission is required.'), [arming, setArming] = useState(false)
+  const arm = useCallback(async () => {
+    if (pending.current || listener.current || useStore.getState().phase !== 'offline') return
+    pending.current = true; setArming(true); const signal = lifetime.current.signal
+    try {
+      const result = await listenForClap(() => { listener.current = null; start.current('clap') }, signal)
+      if (signal.aborted || useStore.getState().phase !== 'offline') result.stop()
+      else { listener.current = result; setStatus(inputContext().state === 'running' ? 'DOUBLE-CLAP ARMED · two sharp claps within 0.9 seconds' : 'Microphone granted. Click Enable double-clap to unlock browser audio analysis.') }
+    } catch { if (!signal.aborted) setStatus('Double-clap unavailable. Check microphone permission or use INITIALISE / Space.') }
+    finally { pending.current = false; if (!signal.aborted) setArming(false) }
+  }, [])
+  useEffect(() => {
+    if (phase !== 'offline') return
+    lifetime.current = new AbortController(); const signal = lifetime.current.signal
+    // Permission query never prompts. First-time authorization remains a click.
+    void navigator.permissions?.query({ name: 'microphone' as PermissionName }).then(permission => { if (permission.state === 'granted' && !signal.aborted) void arm() }).catch(() => {})
+    const unsubscribe = useStore.subscribe(state => { if (state.phase !== 'offline') { lifetime.current.abort(); listener.current?.stop(); listener.current = null } })
+    return () => { lifetime.current.abort(); listener.current?.stop(); listener.current = null; unsubscribe() }
+  }, [phase, arm])
   if (phase !== 'offline') return null
-
-  return (
-    <button className="ignition" onClick={onStart}>
-      {/*
-        Spun by CSS rather than framer. As a motion element with
-        `repeat: Infinity` it was one of the things keeping the exit from ever
-        finishing — AnimatePresence waits for a leaving subtree's animations,
-        and an infinite one never ends.
-      */}
-      <span className="ignition-ring" />
-      <span className="ignition-label">
-        <span className="ignition-word">INITIALISE</span>
-        <span className="ignition-sub">click or press Space to power up</span>
-      </span>
-    </button>
-  )
+  return <div className="ignition"><button className="ignition-start" onClick={() => onStart('manual')}><span className="ignition-ring" /><span className="ignition-label"><span className="ignition-word">INITIALISE</span><span className="ignition-sub">click or press Space to power up</span></span></button>
+    <div className="clap-gate"><p role="status">{status}</p><button disabled={arming} onClick={() => { void sfx.unlockAudio(); listener.current?.stop(); listener.current = null; void inputContext().resume().catch(() => {}); void arm() }}>Enable double-clap</button><small>Microphone permission does not grant autoplay permission. A click may still be needed for sound.</small></div>
+  </div>
 }

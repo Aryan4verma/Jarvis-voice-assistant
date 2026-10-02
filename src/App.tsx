@@ -9,6 +9,8 @@ import { shouldSpeak } from './lib/voiceSettings'
 import { beginListening, beginTiming, markTiming, cancelTiming, timingSnapshot } from './lib/latency'
 import { enterCommand } from './lib/interaction'
 import { shouldAnimate } from './lib/graphics'
+import { beginStartup, startupStatus, aiStartupStatus, finishStartup } from './lib/startup'
+import { getSettings, watchSettings } from './lib/settings'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
 import { startVoice, type Voice, type VoiceMode } from './lib/voice'
@@ -23,6 +25,7 @@ import { forTool } from './lib/fillers'
 import {
   ask,
   warm,
+  isConnected,
   cancel,
   shutdown,
   turns,
@@ -36,7 +39,7 @@ import {
   configurationIssue,
   type AIMessage,
 } from './lib/brain'
-import { startAnalyser, micLevel, stopAudio } from './lib/audio'
+import { startAnalyser, micLevel, stopAudio, inputContext } from './lib/audio'
 import { probeCapabilities } from './lib/capabilities'
 import { TurnCancelled, type Turn } from './lib/turn'
 
@@ -437,8 +440,10 @@ export default function App() {
     // on screen still shows it. Better to say so than to let him quietly forget.
     watchConnection((state) => {
       if (state === 'lost') {
+        startupStatus('bridge', 'UNAVAILABLE')
         store.getState().setError('Bridge connection lost — reconnecting.')
       } else if (state === 'reconnected') {
+        startupStatus('bridge', 'ONLINE')
         store
           .getState()
           .setError('Bridge reconnected. Agent sessions restart; recent chat text remains available.')
@@ -448,13 +453,15 @@ export default function App() {
 
   // -- power on -------------------------------------------------------------
 
-  const powerOn = async () => {
+  const powerOn = async (source: 'manual' | 'clap' = 'manual') => {
     // The ignition button and the space bar can both land here, and the phase
     // only moves after the first await — so without this a double press boots
     // twice, arming two voice loops and two download polls.
     if (booting.current) return
     if (voice.current) { startListening(); return }
     booting.current = true
+    if (store.getState().phase === 'offline') beginStartup(source)
+    store.getState().setPhase('dormant') // also synchronously retires offline clap analysis
     const signal = lifetime.current.signal
 
     try {
@@ -467,6 +474,7 @@ export default function App() {
       // for the rest of the page, recoverable only by reloading. Reset it and
       // put the button back so the user can simply press it again.
       booting.current = false
+      startupStatus('voice', 'UNAVAILABLE'); startupStatus('integrity', 'DEGRADED')
       console.warn('[jarvis] optional voice initialization failed')
       store.getState().setPhase('dormant')
       store
@@ -485,18 +493,17 @@ export default function App() {
 
     // Must happen inside the click handler — browsers won't start an
     // AudioContext or speech synthesis without a user gesture.
-    await sfx.unlockAudio()
+    // Clap is not a browser user gesture: suspended output must never block readiness.
+    void sfx.unlockAudio().then(() => { if (!signal.aborted) sfx.play('boot') }).catch(() => {})
     signal.throwIfAborted()
-    sfx.play('boot')
     // Keep the soundscape opt-in rather than starting a long score over command capture.
     // Ambient music remains available to tools; ECO startup does not start it.
 
-    s.setPhase('boot')
-    // Readiness is independent of the cinematic sequence and optional services.
-    queueMicrotask(() => { if (!signal.aborted && store.getState().phase === 'boot') store.getState().setPhase('dormant') })
+    // The cinematic owns its own bounded presentation clock, never the interaction phase.
 
     registerBridgeHandlers()
-    const warming = warm().catch((err: Error) => { if (!signal.aborted) s.setError(err.message) })
+    const warming = warm().then(() => { if (!signal.aborted) startupStatus('bridge', isConnected() ? 'ONLINE' : 'UNAVAILABLE') }).catch((err: Error) => { if (!signal.aborted) { startupStatus('bridge', 'UNAVAILABLE'); s.setError(err.message) } })
+    void getSettings(signal).then(value => { if (!signal.aborted) startupStatus('ai', aiStartupStatus(value)) }).catch(() => { if (!signal.aborted) startupStatus('ai', 'UNAVAILABLE') })
 
     const issue = configurationIssue()
     if (issue) s.setError(issue.message)
@@ -530,7 +537,9 @@ export default function App() {
     const probing = probeCapabilities()
     try {
       await startAnalyser()
+      if (!signal.aborted) startupStatus('audio', inputContext().state === 'running' ? 'READY' : 'GESTURE NEEDED')
     } catch {
+      if (!signal.aborted) startupStatus('audio', 'UNAVAILABLE')
       console.warn('[jarvis] microphone unavailable; typed chat remains available')
     }
     signal.throwIfAborted()
@@ -555,6 +564,8 @@ export default function App() {
     if (!voice.current) startedVoice.stop()
     booting.current = false
     startedVoice.sync?.()
+    startupStatus('voice', voice.current ? 'ARMED' : 'UNAVAILABLE')
+    startupStatus('integrity', voice.current ? 'LOCAL CHECKS COMPLETE' : 'DEGRADED · TYPED CHAT READY')
   }
 
   // -- level pump + keys ----------------------------------------------------
@@ -574,6 +585,7 @@ export default function App() {
       if (meterTimer) clearTimeout(meterTimer)
       pump()
     }
+    const settingsUnsubscribe = watchSettings(value => startupStatus('ai', aiStartupStatus(value)))
     const unsubscribe = store.subscribe((next, previous) => { if (next.phase !== previous.phase) sync() })
     document.addEventListener('visibilitychange', sync)
     const preference = (event: Event) => { if ((event as CustomEvent).detail === 'off') silence() }
@@ -584,6 +596,7 @@ export default function App() {
       // Escape stands the whole thing down — the one thing the old build had
       // no key for at all.
       if (e.key === 'Escape') {
+        finishStartup()
         e.preventDefault()
         if (store.getState().phase !== 'offline') goDormant()
         return
@@ -682,7 +695,7 @@ export default function App() {
 
     return () => {
       if (meterTimer) clearTimeout(meterTimer)
-      unsubscribe()
+      unsubscribe(); settingsUnsubscribe(); finishStartup()
       document.removeEventListener('visibilitychange', sync)
       window.removeEventListener('jarvis-voice-preference', preference)
       window.removeEventListener('keydown', onKey)
@@ -711,7 +724,7 @@ export default function App() {
         goDormant(); voice.current.stop(); voice.current = null; booting.current = false
         void powerOn()
       }} respond={respond} onStop={goDormant} onVoice={() => void powerOn()} />
-      <Ignition onStart={() => void powerOn()} />
+      <Ignition onStart={source => void powerOn(source)} />
     </>
   )
 }

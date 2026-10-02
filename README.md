@@ -1,13 +1,17 @@
 # J.A.R.V.I.S.
 
-A browser voice assistant with an Iron Man holographic interface. Say
+A browser voice assistant with an Iron Man holographic interface. Windows AI
+Settings supports OpenRouter, OpenAI, Google Gemini and the existing Claude Agent
+login. See [Phase 7 setup, startup and validation](PHASE7.md). Say
 **"Hey Jarvis"**, he wakes, listens, and does real things through your tools —
 searches the web, generates images, drives your phone, reads your mail. The face
-is a web page (React + Vite + Three.js + custom GLSL). The brain is Claude Code,
+is a web page (React + Vite + Three.js + custom GLSL). The original agent brain is Claude Code,
 run headless as a library.
 
-**The only subscription you need is Claude Code.** No API keys, no OpenAI
-account, no cloud bill — the brain runs on your existing Claude Code login, and
+**Claude Agent mode reuses your Claude Code subscription.** Alternatively,
+configure a cloud provider key in AI Settings. Provider charges depend on your
+chosen account/model; there is no automatic paid fallback. In Claude mode the
+brain runs on your existing Claude Code login, and
 the heavy work (the model itself) runs on Anthropic's servers, so even a low-end
 laptop only has to draw the interface. **ElevenLabs is an optional add-on** that
 gives JARVIS a much better voice and sharper hearing; without it he speaks and
@@ -17,10 +21,11 @@ listens through the browser's own speech, and everything still works.
 
 ## Requirements
 
-**In one line:** a Claude Code subscription, plus two free things every computer
-can have — Node.js and Chrome. That's the whole list.
+**In one line:** Node.js and Chrome/Edge, plus either a configured cloud-provider
+key or the existing Claude Code login.
 
-- **Claude Code, installed and logged in** — this is the only account you need.
+- **Claude Agent mode: Claude Code, installed and logged in** — native API modes
+  use their provider key instead.
   Install it with the official method — `npm install -g @anthropic-ai/claude-code`,
   or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
   then run `claude` once and complete login. The bridge reuses that login. **No
@@ -51,7 +56,7 @@ npm ci             # reproducible installation from package-lock.json
 npm start          # runs the brain and the face together
 ```
 
-Then open the URL it prints (http://localhost:5173) in **Chrome**, click **INITIALISE**, and say **“Hey Jarvis”**.
+Then open the URL it prints (http://localhost:5173) in **Chrome**. Click **INITIALISE** or press Space. For double-clap activation, click **Enable double-clap** once to authorize the shared microphone; future starts arm automatically when browser permissions allow it. Say **“Hey Jarvis”** after startup.
 
 Prefer two terminals? Run them separately instead:
 
@@ -152,9 +157,12 @@ prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
 
 Space enters listening immediately after initialization, with no greeting. One
 shared microphone uses echo cancellation and noise suppression. There is no
-microphone capture or WebGL scene before you initialize; the cinematic boot no
-longer blocks readiness for 9.2 seconds. Automatic clap ignition and startup
-music are disabled in the ECO baseline; their existing modules remain available.
+microphone capture before initialization unless you explicitly authorize the
+offline double-clap gate (or the browser has already granted it). WebGL loads
+after the lightweight cinematic. The 3.2-second DOM/CSS/SVG presentation runs
+alongside real initialization; chat and voice do not wait for it. Two sharp
+claps 180–900 ms apart ignite JARVIS, then clap analysis retires immediately.
+Browser autoplay policies still apply. Ambient startup music remains off.
 
 **Voice Settings** configures optional ElevenLabs Scribe and Picovoice keys in
 Windows CurrentUser DPAPI storage outside the repository. Scribe transcribes
@@ -276,10 +284,14 @@ Everything is optional in bridge mode. Frontend settings live in `.env.local`
 
 ### AI settings and typed chat
 
-Open **AI Settings** to choose OpenRouter, save a Windows-protected key, select
+Open **AI Settings** to choose OpenRouter, OpenAI, Google Gemini or Claude Agent,
+save separate Windows-protected provider keys, select
 FAST/BALANCED/DEEP model mappings, and test the connection. Typed chat works
 without enabling voice. Enter sends; STOP/Escape cancels. Claude Agent remains
-available. See [OpenRouter setup and security](OPENROUTER_SETTINGS.md).
+available. Model catalogs load on request; OpenRouter offers search, Free only,
+Vision and Tools filters plus explicit `openrouter/free` selection. See
+[multi-provider setup and security](PHASE7.md) and
+[OpenRouter details](OPENROUTER_SETTINGS.md).
 Browser-direct AI credentials are retired.
 
 ### Bridge

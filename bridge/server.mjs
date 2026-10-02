@@ -25,6 +25,7 @@ import { chromeAvailable, chromeServer } from './chrome.mjs'
 import { visionServer, visionTools } from './vision.mjs'
 import { createSecretStore } from './secrets.mjs'
 import { createRouterClient } from './providers/openrouter-client.mjs'
+import { createNativeClient } from './providers/native-client.mjs'
 import { createAISettings } from './ai-settings.mjs'
 import { settingsHTTP } from './settings-http.mjs'
 import { voiceHTTP } from './voice-settings.mjs'
@@ -147,7 +148,10 @@ const EFFORT = process.env.JARVIS_EFFORT ?? 'high'
 const secrets = createSecretStore()
 const voiceSecrets = { elevenlabs: createSecretStore({ purpose: 'elevenlabs', cache: true }), picovoice: createSecretStore({ purpose: 'picovoice' }) }
 const routerClient = createRouterClient()
-const aiSettings = await createAISettings({ secrets, client: routerClient, claudeModel: MODEL })
+const apiProviders = { openrouter: { secrets, client: routerClient },
+  openai: { secrets: createSecretStore({ purpose: 'openai' }), client: createNativeClient('openai') },
+  gemini: { secrets: createSecretStore({ purpose: 'gemini' }), client: createNativeClient('gemini') } }
+const aiSettings = await createAISettings({ secrets, client: routerClient, providers: apiProviders, claudeModel: MODEL })
 
 /**
  * Both spellings of every renamed built-in are listed on purpose. The SDK
@@ -1099,7 +1103,8 @@ wss.on('connection', (socket) => {
   const buildProvider = () => {
     const selection = aiSettings.selection()
     const instance = bridgeProviderFactory({ ...selection, reasoningEffort: EFFORT })({
-      client: routerClient, getKey: signal => secrets.read(signal), decideTool,
+      client: apiProviders[selection.providerId]?.client ?? routerClient,
+      getKey: signal => (apiProviders[selection.providerId]?.secrets ?? secrets).read(signal), decideTool,
       systemPrompt: `${SYSTEM_PROMPT}\nLocal visual artifacts must be saved in ${ARTIFACT_ROOT} or an explicitly approved JARVIS_FILE_ROOTS folder. Files elsewhere cannot be displayed. Never store credentials there.`,
       cwd: homedir(), debug: process.env.JARVIS_DEBUG === '1',
       onReady(servers) {
@@ -1167,7 +1172,7 @@ wss.on('connection', (socket) => {
       turn.operation = turn.provider.start(request, {
         onEvent: event => {
           scope.send(event)
-          if (scope.live() && turn.provider.describe().providerId === 'openrouter') {
+          if (scope.live() && turn.provider.describe().kind === 'chat') {
             if (event.type === 'error') aiSettings.report(turn.revision, event.error)
             else if (event.type === 'done') aiSettings.report(turn.revision)
           }

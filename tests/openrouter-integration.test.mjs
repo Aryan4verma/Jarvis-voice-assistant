@@ -21,10 +21,10 @@ async function freePort() {
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port
 }
 
-test('real authenticated bridge/broker stores a protected key, streams functions/vision and cancels on settings changes', { timeout: 60000, skip: process.platform !== 'win32' }, async () => {
+test('real authenticated bridge/broker protects isolated provider keys, streams functions/vision and cancels on settings changes', { timeout: 60000, skip: process.platform !== 'win32' }, async () => {
   const sandbox = await mkdtemp(join(tmpdir(), 'jarvis-router-integration-'))
   const port = await freePort(), facePort = await freePort(), origin = `http://127.0.0.1:${facePort}`
-  const env = { ...process.env, LOCALAPPDATA: sandbox, JARVIS_RUNTIME_DIR: sandbox, JARVIS_AI_PROVIDER: 'claude-agent', JARVIS_TEST_OPENROUTER: '1', JARVIS_BRIDGE_PORT: String(port), JARVIS_ALLOWED_ORIGINS: origin, JARVIS_FILE_ROOTS: '' }
+  const env = { ...process.env, LOCALAPPDATA: sandbox, JARVIS_RUNTIME_DIR: sandbox, JARVIS_AI_PROVIDER: 'claude-agent', JARVIS_TEST_OPENROUTER: '1', JARVIS_TEST_NATIVE: '1', JARVIS_BRIDGE_PORT: String(port), JARVIS_ALLOWED_ORIGINS: origin, JARVIS_FILE_ROOTS: '' }
   const children = []; let logs = '', socket
   const launch = args => {
     const child = spawn(process.execPath, args, { cwd: ROOT, env, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
@@ -51,6 +51,8 @@ test('real authenticated bridge/broker stores a protected key, streams functions
     assert.equal((await api('settings', 'PUT', preferences)).status, 200)
     const check = await api('test', 'POST'); assert.equal(check.status, 200)
     const checked = await check.text(); assert.ok(!checked.includes(KEY) && !checked.includes('private-key-account-fixture')); assert.equal(JSON.parse(checked).readiness, 'ready')
+    // Capability discovery is an explicit Settings action, never a generation-time catalog refresh.
+    assert.equal((await api('models')).status, 200)
     socket = new WebSocket(`ws://127.0.0.1:${port}/ws`, { origin, headers: { authorization: `Bearer ${state.token}` } })
     const seen = []; socket.on('message', raw => seen.push(JSON.parse(raw))); await once(socket, 'open')
     const ask = (turnId, prompt) => socket.send(JSON.stringify({ type: 'ask', turnId, messages: [{ role: 'user', content: prompt }] }))
@@ -72,6 +74,34 @@ test('real authenticated bridge/broker stores a protected key, streams functions
     assert.ok(seen.some(event => event.type === 'text' && event.turnId === 'B'))
     assert.equal((await api('key', 'DELETE')).status, 200)
     assert.equal((await (await api('settings')).json()).keyConfigured, false)
+    for (const provider of ['openai', 'gemini']) {
+      const key = KEY + '-' + provider, model = provider === 'openai' ? 'gpt-5-mini' : 'gemini-3-flash-preview'
+      const save = await api('key?provider=' + provider, 'POST', { key }); assert.equal(save.status, 200)
+      const metadata = await save.text(); assert.ok(!metadata.includes(key)); assert.equal(JSON.parse(metadata).providers[provider].configured, true)
+      assert.ok(!(await readFile(join(sandbox, `JarvisAI/credentials/${provider}.dpapi`))).includes(Buffer.from(key)))
+      const prefs = { providerId: provider, mode: 'balanced', models: { fast: '', balanced: model, deep: '' } }
+      assert.equal((await api('settings', 'PUT', prefs)).status, 200)
+      assert.equal((await api('models?provider=' + provider)).status, 200)
+      const tested = await (await api('test?provider=' + provider, 'POST')).json(); assert.equal(tested.readiness, 'ready'); assert.ok(!JSON.stringify(tested).includes(key))
+      ask(provider + '-UI', 'reset')
+      await until(async () => { assert.ok(seen.some(e => e.type === 'done' && e.turnId === provider + '-UI')) })
+      assert.ok(seen.some(e => e.type === 'ui' && e.turnId === provider + '-UI'))
+      ask(provider + '-VISION', 'look')
+      const camera = await until(async () => { const event = seen.find(e => e.type === 'capture' && e.turnId === provider + '-VISION'); assert.ok(event); return event })
+      socket.send(JSON.stringify({ type: 'reply', turnId: camera.turnId, id: camera.id, data: 'eA==', mimeType: 'image/png' }))
+      await until(async () => { assert.ok(seen.some(e => e.type === 'done' && e.turnId === camera.turnId)) })
+      ask(provider + '-A', 'hold'); await until(async () => { assert.ok(seen.some(e => e.type === 'text' && e.turnId === provider + '-A')) })
+      assert.equal((await api('settings', 'PUT', { ...prefs, mode: 'fast' })).status, 200)
+      ask(provider + '-B', 'Next'); await until(async () => { assert.ok(seen.some(e => e.type === 'done' && e.turnId === provider + '-B')) })
+      await wait(300)
+      const ended = seen.findIndex(e => e.type === 'cancelled' && e.turnId === provider + '-A'); assert.ok(ended >= 0)
+      assert.equal(seen[ended].backend, 'request-abort-requested'); assert.ok(!seen.slice(ended + 1).some(e => e.turnId === provider + '-A'))
+      assert.ok(!JSON.stringify(seen).includes(key) && !logs.includes(key))
+    }
+    const isolated = await (await api('settings')).json(); assert.equal(isolated.providers.openai.configured, true); assert.equal(isolated.providers.gemini.configured, true)
+    assert.equal(isolated.profiles.openrouter.models.balanced, 'fixture/model'); assert.equal(isolated.profiles.openai.models.balanced, 'gpt-5-mini')
+    assert.equal((await api('key?provider=openai', 'DELETE')).status, 200)
+    assert.equal((await (await api('settings')).json()).providers.gemini.configured, true)
     assert.ok(!JSON.stringify(seen).includes(KEY) && !logs.includes(KEY) && !logs.includes('private-key-account-fixture'))
   } finally {
     socket?.terminate()

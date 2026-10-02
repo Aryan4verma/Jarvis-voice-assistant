@@ -13,10 +13,10 @@ export function routerError(error) {
   const code = typeof error?.code === 'string' ? error.code : ''
   const source = error?.metadata?.limit_source
   const upstream = typeof error?.metadata?.provider_name === 'string' || source === 'upstream_provider_shared_pool'
-  const free = error?.modelId?.endsWith(':free')
+  const free = error?.modelId?.endsWith(':free') || error?.modelId === 'openrouter/free'
   const wait = retryAfter(error?.retryAfter)
   const hint = wait !== undefined ? ` Wait ${wait} seconds before trying again.` : ' Try again later.'
-  let category = 'unknown', message
+  let category = 'unknown', message, normalizedCode
   if (error?.name === 'AbortError') category = 'cancelled'
   else if (error?.name === 'TimeoutError' || [408,504].includes(status)) category = 'timeout'
   else if ([401,403].includes(status) || code === 'authentication_error') {
@@ -28,15 +28,15 @@ export function routerError(error) {
   } else if (status === 404 || code === 'model_not_found') {
     category = 'model-unavailable'; message = 'This model is no longer available. Refresh models and select a model in AI Settings.'
   } else if (status === 402) {
-    category = 'unavailable'
+    category = 'unavailable'; normalizedCode = source === 'openrouter_in_flight_budget' ? 'provider_busy' : 'quota_exhausted'
     message = source === 'openrouter_in_flight_budget' ? `OpenRouter’s temporary in-flight spending budget is full.${hint}`
       : source === 'openrouter_key_limit' ? 'OpenRouter API-key credit limit exhausted. Check the key’s spending cap.'
       : 'Insufficient OpenRouter credits or request budget (HTTP 402). Check the balance, key spending limit, or reduce request size.'
   } else if (status >= 500 || code === 'server_error') {
-    category = 'unavailable'; message = `${free ? 'The selected free model/provider' : 'OpenRouter or the selected provider'} is temporarily unavailable (HTTP ${status || 503}).${hint} No paid fallback was selected.`
+    category = 'unavailable'; normalizedCode = 'provider_busy'; message = `${free ? 'The selected free model/provider' : 'OpenRouter or the selected provider'} is temporarily unavailable (HTTP ${status || 503}).${hint} No paid fallback was selected.`
   } else if ([400,422].includes(status)) category = 'invalid-request'
   else if (error instanceof TypeError) category = 'network'
-  return aiError(category, { providerId:'openrouter', status, ...(wait !== undefined ? { retryAfterSeconds: wait } : {}) }, message)
+  return aiError(category, { providerId:'openrouter', status, ...(normalizedCode ? { code: normalizedCode } : {}), ...(wait !== undefined ? { retryAfterSeconds: wait } : {}) }, message)
 }
 /** Read only bounded error metadata. Raw messages/account/provider payloads never reach UI or logs. */
 export async function routerFailure(response, signal, modelId) {
@@ -61,6 +61,8 @@ export function routerUsage(usage) {
 }
 export const routerReason = value => ({stop:'complete',length:'max-tokens',tool_calls:'tool-continuation',content_filter:'refused',error:'error'})[value] ?? 'unknown'
 export function routerInfo(model) {
+  if (model?.id === 'openrouter/free') return { providerId: 'openrouter', modelId: model.id, displayName: 'OpenRouter', kind: 'chat',
+    capabilities: { text: true, vision: true, streaming: true, toolCalling: true, agentRuntime: false, reasoningControls: 'unknown' } }
   const inputs = model?.architecture?.input_modalities, outputs = model?.architecture?.output_modalities, params = model?.supported_parameters
   return {providerId:'openrouter',modelId:model?.id ?? '',displayName:'OpenRouter',kind:'chat',capabilities:{
     text:Array.isArray(inputs) && Array.isArray(outputs) ? inputs.includes('text') && outputs.includes('text') : 'unknown',
@@ -98,9 +100,10 @@ export function createRouterClient(fetchImpl = fetch) {
       for(const value of json.data) if(validModelId(value?.id)) {
         const info=routerInfo(value)
         if(info.capabilities.text===false) continue
-        const price = key => {const n=Number(value.pricing?.[key]);return value.pricing?.[key] != null && Number.isFinite(n) && n>=0 ? n*1000000 : undefined}
+        const price = key => {const raw=value.pricing?.[key], n=Number(raw);return ['string','number'].includes(typeof raw) && String(raw).trim() !== '' && Number.isFinite(n) && n>=0 ? n*1000000 : undefined}
         fresh.set(value.id,{...info,name:typeof value.name==='string' ? value.name.slice(0,160) : value.id,
-          inputPrice:price('prompt'),outputPrice:price('completion')})
+          inputPrice:price('prompt'),outputPrice:price('completion'),
+          free: price('prompt') === 0 && price('completion') === 0 && Object.values(value.pricing ?? {}).every(raw => ['string','number'].includes(typeof raw) && String(raw).trim() !== '' && Number(raw) === 0)})
       }
       models=fresh; expires=Date.now()+30*60000
       return [...models.values()]
@@ -112,9 +115,10 @@ export function createRouterClient(fetchImpl = fetch) {
     cached: id => models.get(id) ?? null,
     async model(id,signal) {
       if(!validModelId(id)) throw new AIProviderError(aiError('model-unavailable',{providerId:'openrouter'},'Choose an OpenRouter model in AI Settings.'))
-      await catalog(signal)
+      signal?.throwIfAborted()
       const model=models.get(id)
-      if(!model) throw new AIProviderError(aiError('model-unavailable',{providerId:'openrouter'}))
+      if (!model && id === 'openrouter/free') return { ...routerInfo({ id }), name: 'Free Models Router', inputPrice: 0, outputPrice: 0 }
+      if (!model) return { ...routerInfo({ id }), name: id } // manual text fallback; Settings verifies capabilities via catalog
       return model
     },
     async testKey(key,signal) {

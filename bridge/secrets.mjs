@@ -7,7 +7,7 @@ import { atomicUserWrite, privateDirectory, readBoundedFile, userDirectory } fro
 export const validKey = key => typeof key === 'string' && key.length >= 20 && key.length <= 512 && /^[A-Za-z0-9_-]+$/.test(key)
 /** Built-in Windows DPAPI, current user. Secrets travel over pipes, never command arguments. */
 export function dpapi(action, bytes, signal, purpose = 'openrouter') {
-  if (!['openrouter', 'elevenlabs', 'picovoice'].includes(purpose)) return Promise.reject(new Error('Invalid secret purpose.'))
+  if (!['openrouter', 'openai', 'gemini', 'elevenlabs', 'picovoice'].includes(purpose)) return Promise.reject(new Error('Invalid secret purpose.'))
   if (process.platform !== 'win32') return Promise.reject(new Error('Windows DPAPI is unavailable. Claude mode remains available.'))
   return new Promise((resolve, reject) => {
     let child, output = '', settled = false
@@ -37,7 +37,7 @@ export function dpapi(action, bytes, signal, purpose = 'openrouter') {
   })
 }
 export function createSecretStore({ directory = join(userDirectory, 'credentials'), crypt = dpapi, supported = process.platform === 'win32', purpose = 'openrouter', cache = false } = {}) {
-  if (!['openrouter', 'elevenlabs', 'picovoice'].includes(purpose)) throw new Error('Invalid secret purpose.')
+  if (!['openrouter', 'openai', 'gemini', 'elevenlabs', 'picovoice'].includes(purpose)) throw new Error('Invalid secret purpose.')
   const valid = key => purpose === 'picovoice'
     ? typeof key === 'string' && key.length >= 20 && key.length <= 512 && /^[A-Za-z0-9+/=_-]+$/.test(key)
     : validKey(key)

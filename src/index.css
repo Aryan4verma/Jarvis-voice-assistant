@@ -1923,3 +1923,40 @@ kbd {
 .scene-standby span { width: 22vmin; aspect-ratio: 1; border: 1px solid #00a5ba; border-radius: 50%; box-shadow: 0 0 28px #00b8d033, inset 0 0 24px #00b8d022; }
 .scene-shell .scene { transition: opacity 180ms ease; background: #01060c; }
 .graphics-note, .scene-standby small { position: fixed; top: 65px; left: 30px; color: #7fb6bf; z-index: 4; }
+
+/* Phase 7: DOM-only cinematic, independent from interaction readiness. */
+.ignition-start { border: 0; background: none; color: inherit; display: grid; place-items: center; cursor: pointer; width: 280px; height: 280px; font: inherit; }
+.clap-gate { position: absolute; bottom: 168px; max-width: 520px; text-align: center; padding: 0 22px; font-size: 12px; line-height: 1.6; }
+.clap-gate small { display: block; opacity: .55; margin-top: 9px; }
+.clap-gate button, .cinematic-boot button { background: #07151e; color: #97d7e6; border: 1px solid #225468; padding: 9px 16px; cursor: pointer; }
+.cinematic-boot { position: fixed; inset: 0; z-index: 6; display: flex; align-items: center; justify-content: center; gap: 7vw; background: #01060c; color: #91dce9; pointer-events: none; animation: terminalIn .2s ease-out; }
+.cinematic-boot button { pointer-events: auto; font: inherit; font-size: 11px; }
+.cinematic-boot.boot-exit { opacity: 0; transition: opacity 350ms; }
+.boot-terminal { width: min(570px, 74vw); font-family: 'Courier New', monospace; }
+.boot-eyebrow { font-size: 10px; letter-spacing: .18em; color: #52aaba; }
+.boot-terminal h1 { font-size: clamp(24px, 4vw, 48px); letter-spacing: .24em; margin: 18px 0; font-weight: 400; }
+.boot-confirm { font-size: 12px; line-height: 1.9; opacity: .7; }
+.boot-system-lines { min-height: 220px; padding: 10px 0; }
+.boot-system-line { display: flex; align-items: baseline; gap: 10px; margin: 13px 0; font-size: 11px; animation: terminalIn 160ms ease-out; }
+.boot-system-line strong { font-size: 10px; font-weight: 400; color: #66e0b4; }
+.boot-system-line strong[data-status="UNAVAILABLE"], .boot-system-line strong[data-status="NOT CONFIGURED"] { color: #d3ad70; }
+.boot-leader { flex: 1; border-bottom: 1px dotted #184553; }
+.boot-online { opacity: 0; letter-spacing: .2em; font-size: 18px; color: #c8f8ff; transition: opacity 180ms; }
+.boot-online.visible { opacity: 1; }
+.boot-online small { display: block; font-size: 8px; letter-spacing: .1em; margin-top: 8px; opacity: .5; }
+.boot-available { font: 10px/1.5 'Courier New', monospace; opacity: .55; }
+.boot-reticle { width: min(22vw, 280px); fill: none; stroke: #2d8497; stroke-width: 1; animation: reticleIn 2s ease-out both; }
+.provider-picker { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; border: 0; padding: 10px 0; }
+.provider-picker button { padding: 12px; text-align: left; background: #07131d; border: 1px solid #203746; }
+.provider-picker button[aria-pressed="true"] { border-color: #55cfdb; background: #0b222c; }
+.provider-picker small { display: block; margin-top: 5px; font-size: 10px; }
+.provider-key, .model-mapping { border-top: 1px solid #173641; padding-top: 10px; margin-top: 12px; }
+.model-filters { display: flex; gap: 18px; margin: 12px 0; }
+.model-filters label { display: flex; flex-direction: row; gap: 6px; align-items: center; margin: 0; font-size: 12px; }
+.model-filters input { width: auto; margin: 0; }
+@keyframes terminalIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@keyframes reticleIn { from { opacity: 0; transform: rotate(-25deg) scale(.9); } to { opacity: .8; transform: none; } }
+@media (max-width: 740px) { .boot-reticle { display: none; } .boot-terminal { width: 84vw; } }
+@media (max-height: 660px) { .ignition-start { transform: translateY(-85px) scale(.8); } .clap-gate { bottom: 160px; } .cinematic-boot { align-items: flex-start; padding-top: 38px; } .boot-system-lines { min-height: 0; padding: 5px 0; } .boot-system-line { margin: 6px 0; font-size: 10px; } .boot-terminal h1 { margin: 9px 0; font-size: 28px; } .boot-confirm { margin: 8px 0; font-size: 10px; line-height: 1.6; } .boot-reticle { align-self: center; margin-bottom: 160px; } }
+@media (max-width: 540px) { .clap-gate { bottom: 205px; font-size: 11px; } }
+@media (prefers-reduced-motion: reduce) { .cinematic-boot, .boot-reticle, .boot-system-line { animation: none; } .boot-online, .cinematic-boot.boot-exit { transition: none; } }

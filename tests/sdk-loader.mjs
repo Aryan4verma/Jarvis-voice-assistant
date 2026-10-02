@@ -77,12 +77,37 @@ export async function openRemote(url, headers, timeout) {
 }
 `
 export async function resolve(specifier, context, next) {
+  if (process.env.JARVIS_TEST_NATIVE === '1' && specifier === './providers/native-client.mjs' && context.parentURL?.endsWith('/bridge/server.mjs')) {
+    const fixture = `
+      import { createNativeClient as realClient } from ${JSON.stringify(pathToFileURL(join(ROOT, 'bridge/providers/native-client.mjs')).href)};
+      const frame = value => 'data: ' + JSON.stringify(value) + '\\n\\n';
+      export const createNativeClient = provider => realClient(provider, async (url, init) => {
+        const openai = provider === 'openai', model = openai ? 'gpt-5-mini' : 'gemini-3-flash-preview';
+        if (!init.body) return Response.json(openai ? {data:[{id:model}]} : {models:[{name:'models/'+model,supportedGenerationMethods:['generateContent']}]});
+        const body=JSON.parse(init.body), last=(openai ? body.input : body.contents).at(-1);
+        const prompt=openai ? last.content?.find?.(part=>part.type==='input_text')?.text : last.parts?.find(part=>part.text)?.text;
+        const tool = prompt === 'look' ? 'mcp__jarvis_eyes__look' : 'mcp__jarvis_ui__ui_reset';
+        const chunks=['look','reset'].includes(prompt) ? [openai
+          ? {type:'response.completed',response:{output:[{type:'function_call',call_id:'native-call',name:tool,arguments:'{}'}]}}
+          : {candidates:[{content:{parts:[{functionCall:{id:'native-call',name:tool,args:{}}}]},finishReason:'STOP'}]}]
+          : openai ? [{type:'response.output_text.delta',delta:'Native mock answer.'},{type:'response.completed',response:{output:[],usage:{input_tokens:4,output_tokens:3}}}]
+          : [{candidates:[{content:{parts:[{text:'Native mock answer.'}]},finishReason:'STOP'}],usageMetadata:{promptTokenCount:4,candidatesTokenCount:3}}];
+        const data=chunks.map(frame).join('');
+        if (prompt==='hold') return new Response(new ReadableStream({start(controller){
+          controller.enqueue(new TextEncoder().encode(frame(openai ? {type:'response.output_text.delta',delta:'Started.'} : {candidates:[{content:{parts:[{text:'Started.'}]}}]})));
+          setTimeout(()=>{try{controller.enqueue(new TextEncoder().encode(data));controller.close()}catch{}},250);
+        }}));
+        return new Response(data);
+      });
+    `
+    return { url: `data:text/javascript,${encodeURIComponent(fixture)}`, shortCircuit: true }
+  }
   if (process.env.JARVIS_TEST_OPENROUTER === '1' && specifier === './providers/openrouter-client.mjs' && context.parentURL?.endsWith('/bridge/server.mjs')) {
     const fixture = `
       import { createRouterClient as realClient } from ${JSON.stringify(pathToFileURL(join(ROOT, 'bridge/providers/openrouter-client.mjs')).href)};
       const frame = value => 'data: ' + JSON.stringify(value) + '\\n\\n';
       export const createRouterClient = () => realClient(async (url, init) => {
-        if(url.endsWith('/models')) return Response.json({data:[{id:'fixture/model',name:'Fixture',architecture:{input_modalities:['text','image'],output_modalities:['text']},supported_parameters:['tools']}]});
+        if(url.endsWith('/models')) return Response.json({data:[{id:'fixture/model',name:'Fixture',architecture:{input_modalities:['text','image'],output_modalities:['text']},supported_parameters:['tools'],pricing:{prompt:'0',completion:'0'}},{id:'fixture/paid',name:'Paid fixture',pricing:{prompt:'0.000001',completion:'0.000002'}}]});
         if(url.endsWith('/key')) return Response.json({data:{label:'private-key-account-fixture'}});
         const body=JSON.parse(init.body), last=body.messages.at(-1);
         let chunks;
