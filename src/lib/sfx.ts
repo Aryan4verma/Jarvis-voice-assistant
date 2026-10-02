@@ -10,6 +10,8 @@ let ctx: AudioContext | null = null
 let master: GainNode | null = null
 const samples = new Map<Cue, AudioBuffer>()
 let ambient: { source: AudioBufferSourceNode; gain: GainNode } | null = null
+/** Read existing output readiness without creating another context. */
+export const audioState = () => ctx?.state
 
 /** Where the master sits when JARVIS isn't speaking. */
 let volume = 0.5

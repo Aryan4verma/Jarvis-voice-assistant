@@ -9,7 +9,8 @@ import { shouldSpeak } from './lib/voiceSettings'
 import { beginListening, beginTiming, markTiming, cancelTiming, timingSnapshot } from './lib/latency'
 import { enterCommand } from './lib/interaction'
 import { shouldAnimate } from './lib/graphics'
-import { beginStartup, startupStatus, aiStartupStatus, finishStartup } from './lib/startup'
+import { beginStartup, startupStatus, startupSnapshot, aiStartupStatus, finishStartup } from './lib/startup'
+import { createPowerOn, type StartupSource } from './lib/powerOn'
 import { getSettings, watchSettings } from './lib/settings'
 import { Diagnostics } from './ui/Diagnostics'
 import { useStore } from './store'
@@ -64,6 +65,7 @@ const AWAIT_SPEECH_MS = 14000
  *  drops back to standby. Long enough that you don't have to say the name
  *  again to continue a thought. */
 const FOLLOW_UP_MS = 11000
+const AUDIO_POLICY_MESSAGE = 'Browser audio is paused. Click Allow browser audio to authorize playback and microphone analysis. Typed chat remains available.'
 
 /** The same mishearings voice.ts accepts for the wake word — otherwise a turn
  *  that woke him as "travis" gets that word sent on to the model as a question. */
@@ -81,7 +83,7 @@ export default function App() {
 
   const interaction = useRef<Turn | null>(null)
   const lookingRequest = useRef<string | null>(null)
-  const booting = useRef(false)
+  const power = useRef<ReturnType<typeof createPowerOn> | null>(null)
   const channelsReady = useRef(false)
   const lifetime = useRef(new AbortController())
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -453,38 +455,47 @@ export default function App() {
 
   // -- power on -------------------------------------------------------------
 
-  const powerOn = async (source: 'manual' | 'clap' = 'manual') => {
-    // The ignition button and the space bar can both land here, and the phase
-    // only moves after the first await — so without this a double press boots
-    // twice, arming two voice loops and two download polls.
-    if (booting.current) return
-    if (voice.current) { startListening(); return }
-    booting.current = true
-    if (store.getState().phase === 'offline') beginStartup(source)
-    store.getState().setPhase('dormant') // also synchronously retires offline clap analysis
-    const signal = lifetime.current.signal
+  const powerOn = (source: StartupSource = 'manual') => {
+    // Preserve one guarded startup operation across every activation path.
+    power.current ??= createPowerOn({
+      ready: () => Boolean(voice.current?.live()) && !['MIC BLOCKED', 'VOICE UNAVAILABLE'].includes(startupSnapshot().systems.voice),
+      begin: origin => {
+        if (store.getState().phase === 'offline') beginStartup(origin)
+        store.getState().setPhase('dormant') // retires clap analysis before voice begins
+        store.getState().setError(null)
+        startupStatus('voice', 'INITIALIZING')
+        voice.current?.stop(); voice.current = null
+      },
+      initialize: ignite,
+      failed: err => {
+        if (lifetime.current.signal.aborted) return
+        const blocked = (err as DOMException)?.name === 'NotAllowedError'
+        startupStatus('voice', blocked ? 'MIC BLOCKED' : 'VOICE UNAVAILABLE')
+        startupStatus('integrity', 'DEGRADED · TYPED CHAT READY')
+        store.getState().setError(blocked
+          ? 'Microphone permission denied. Allow microphone access in your browser, then Retry voice. Typed chat remains available.'
+          : 'Voice could not initialize. Check your microphone/browser and Retry voice. Typed chat remains available.')
+      },
+    })
+    return power.current.start(source)
+  }
 
-    try {
-      await ignite()
-    } catch (err) {
+  const prepareAudio = () => {
+    const signal = lifetime.current.signal
+    // Both contexts are existing shared resources. Resume inside the user gesture,
+    // before microphone permission/bridge awaits; never wait on autoplay unlock.
+    const input = inputContext()
+    const report = (confirmed = false) => {
       if (signal.aborted) return
-      // The guard must not outlive a failed boot. Audio unlock can be refused,
-      // the microphone prompt dismissed, the bridge unreachable at the wrong
-      // moment — and with the flag still latched the ignition button was dead
-      // for the rest of the page, recoverable only by reloading. Reset it and
-      // put the button back so the user can simply press it again.
-      booting.current = false
-      startupStatus('voice', 'UNAVAILABLE'); startupStatus('integrity', 'DEGRADED')
-      console.warn('[jarvis] optional voice initialization failed')
-      store.getState().setPhase('dormant')
-      store
-        .getState()
-        .setError(
-          err instanceof Error
-            ? `Power-up failed: ${err.message}`
-            : 'Power-up failed. Click to try again.',
-        )
+      const blocked = input.state !== 'running' || sfx.audioState() !== 'running'
+      startupStatus('audio', blocked ? 'GESTURE NEEDED' : 'READY')
+      if (blocked && (confirmed || navigator.userActivation && !navigator.userActivation.hasBeenActive)) store.getState().setError(AUDIO_POLICY_MESSAGE)
+      else if (!blocked && store.getState().error === AUDIO_POLICY_MESSAGE) store.getState().setError(null)
     }
+    void input.resume().then(() => report(true)).catch(() => report(true))
+    void sfx.unlockAudio().then(() => { report(true); if (!signal.aborted) sfx.play('boot') }).catch(() => report(true))
+    report()
+    return report
   }
 
   const ignite = async () => {
@@ -494,7 +505,7 @@ export default function App() {
     // Must happen inside the click handler — browsers won't start an
     // AudioContext or speech synthesis without a user gesture.
     // Clap is not a browser user gesture: suspended output must never block readiness.
-    void sfx.unlockAudio().then(() => { if (!signal.aborted) sfx.play('boot') }).catch(() => {})
+    const reportAudio = prepareAudio()
     signal.throwIfAborted()
     // Keep the soundscape opt-in rather than starting a long score over command capture.
     // Ambient music remains available to tools; ECO startup does not start it.
@@ -512,7 +523,7 @@ export default function App() {
     // "Hey Jarvis" isn't waiting on an 86MB download. Deliberately not awaited
     // — if it's slow, JARVIS comes up on the system voice and swaps over the
     // moment the model is ready.
-    if (TTS_ENGINE === 'kokoro') {
+    if (TTS_ENGINE === 'kokoro' && !voicePoll.current && !kokoro.isReady() && !kokoro.isUnavailable()) {
       void kokoro.load()
       voicePoll.current = setInterval(() => {
         const p = kokoro.loadProgress()
@@ -535,12 +546,15 @@ export default function App() {
     // The analyser and command/wake engines share the same microphone.
     // Optional readiness checks run concurrently with microphone permission.
     const probing = probeCapabilities()
+    startupStatus('voice', 'OPENING MICROPHONE')
     try {
       await startAnalyser()
-      if (!signal.aborted) startupStatus('audio', inputContext().state === 'running' ? 'READY' : 'GESTURE NEEDED')
-    } catch {
+      reportAudio()
+      if (!signal.aborted) startupStatus('voice', 'INITIALIZING')
+    } catch (error) {
       if (!signal.aborted) startupStatus('audio', 'UNAVAILABLE')
       console.warn('[jarvis] microphone unavailable; typed chat remains available')
+      throw error // do not request the denied microphone a second time via startVoice
     }
     signal.throwIfAborted()
 
@@ -558,14 +572,18 @@ export default function App() {
       onPartial: (text) => { if (!signal.aborted) onPartial(text) },
       onUtterance: (text) => { if (!signal.aborted) onUtterance(text) },
       onError: (message) => { if (!signal.aborted) onVoiceError(message) },
+      onStatus: status => {
+        if (signal.aborted) return
+        startupStatus('voice', status === 'wake-ready' ? 'WAKE READY' : status === 'ready' ? 'VOICE READY' : status === 'blocked' ? 'MIC BLOCKED' : 'VOICE UNAVAILABLE')
+        startupStatus('integrity', status === 'ready' || status === 'wake-ready' ? 'LOCAL CHECKS COMPLETE' : 'DEGRADED · TYPED CHAT READY')
+      },
     })
     if (signal.aborted) { startedVoice.stop(); return }
     voice.current = startedVoice.live() ? startedVoice : null
     if (!voice.current) startedVoice.stop()
-    booting.current = false
     startedVoice.sync?.()
-    startupStatus('voice', voice.current ? 'ARMED' : 'UNAVAILABLE')
-    startupStatus('integrity', voice.current ? 'LOCAL CHECKS COMPLETE' : 'DEGRADED · TYPED CHAT READY')
+    if (!voice.current && startupSnapshot().systems.voice !== 'MIC BLOCKED') startupStatus('voice', 'VOICE UNAVAILABLE')
+    startupStatus('integrity', !voice.current ? 'DEGRADED · TYPED CHAT READY' : startupSnapshot().systems.voice === 'INITIALIZING' ? 'VOICE INITIALIZING · TYPED CHAT READY' : 'LOCAL CHECKS COMPLETE')
   }
 
   // -- level pump + keys ----------------------------------------------------
@@ -685,7 +703,11 @@ export default function App() {
       e.preventDefault()
 
       const phase = store.getState().phase
-      if (phase === 'offline' || !voice.current && !booting.current) {
+      if (phase === 'offline') {
+        void powerOn() // power-up enters wake standby; the next Space is push-to-talk
+      } else if (power.current?.pending()) {
+        return
+      } else if (!voice.current?.live()) {
         void powerOn().then(() => { if (voice.current && !lifetime.current.signal.aborted) startListening() })
       } else {
         startListening()
@@ -705,6 +727,7 @@ export default function App() {
       shutdown()
       if (voicePoll.current) clearInterval(voicePoll.current)
       voice.current?.stop()
+      voice.current = null
       stopAudio()
       speaker.current?.cancel()
       // The camera must not outlive the page that turned it on.
@@ -721,9 +744,10 @@ export default function App() {
       <Diagnostics />
       <ChatInput onVoiceChanged={() => {
         if (!voice.current) return
-        goDormant(); voice.current.stop(); voice.current = null; booting.current = false
+        if (power.current?.pending()) return
+        goDormant(); voice.current.stop(); voice.current = null
         void powerOn()
-      }} respond={respond} onStop={goDormant} onVoice={() => void powerOn()} />
+      }} respond={respond} onStop={goDormant} onVoice={() => void powerOn()} onAudio={prepareAudio} />
       <Ignition onStart={source => void powerOn(source)} />
     </>
   )

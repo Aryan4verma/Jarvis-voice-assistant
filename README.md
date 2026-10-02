@@ -117,6 +117,11 @@ MCP configuration before enabling writes. No new browser transport is implemente
 | G | Optional hand interaction |
 
 Voice Replies defaults to Always; Voice requests only and Off are available.
+INITIALISE, double-clap and offline Space automatically initialize voice during
+startup; no separate Enable Voice action is required. Startup enters wake standby;
+press Space again for push-to-talk. A denied microphone leaves typed chat usable
+and shows Retry voice. Native browser permission prompts and autoplay restrictions
+still apply; Allow browser audio appears only when audio needs a user gesture.
 Voice Settings stores optional voice credentials under Windows protection.
 Browser recognition may send audio to the browser vendor. ElevenLabs audio goes
 to ElevenLabs when used; command STT does not continuously upload standby room
@@ -183,6 +188,7 @@ npm run test:providers
 npm run test:openrouter
 npm run test:voice
 npm run test:phase7
+npm run test:startup
 git diff --check
 ```
 

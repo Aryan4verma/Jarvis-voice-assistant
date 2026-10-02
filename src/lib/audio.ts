@@ -10,6 +10,7 @@ let analyser: AnalyserNode | null = null
 let buf: Uint8Array | null = null
 
 let opening: Promise<MediaStream> | null = null
+let analysing: Promise<void> | null = null
 let generation = 0
 export async function getMic(): Promise<MediaStream> {
   if (stream?.getAudioTracks().some(track => track.readyState === 'live')) return stream
@@ -31,7 +32,7 @@ export function inputContext(): AudioContext {
   return ctx
 }
 export function stopAudio() {
-  generation++; opening = null
+  generation++; opening = null; analysing = null
   stream?.getTracks().forEach(track => track.stop()); stream = null
   if (ctx) void ctx.close().catch(() => {})
   ctx = null; analyser = null; buf = null
@@ -39,14 +40,21 @@ export function stopAudio() {
 
 export async function startAnalyser(): Promise<void> {
   if (analyser) return
-  const s = await getMic()
-  const c = inputContext()
-  const src = c.createMediaStreamSource(s)
-  analyser = c.createAnalyser()
-  analyser.fftSize = 512
-  analyser.smoothingTimeConstant = 0.75
-  src.connect(analyser)
-  buf = new Uint8Array(analyser.frequencyBinCount)
+  if (analysing) return analysing
+  const epoch = generation
+  const pending = (async () => {
+    const s = await getMic()
+    if (epoch !== generation) throw new Error('Microphone analysis initialization cancelled.')
+    const c = inputContext()
+    const src = c.createMediaStreamSource(s)
+    analyser = c.createAnalyser()
+    analyser.fftSize = 512
+    analyser.smoothingTimeConstant = 0.75
+    src.connect(analyser)
+    buf = new Uint8Array(analyser.frequencyBinCount)
+  })()
+  analysing = pending
+  try { await pending } finally { if (analysing === pending) analysing = null }
 }
 
 /** 0..1 loudness. Returns 0 before the analyser is up. */

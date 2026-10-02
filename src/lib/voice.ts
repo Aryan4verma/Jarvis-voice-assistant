@@ -53,6 +53,8 @@ export type VoiceHandlers = {
   onUtterance: (text: string) => void
   /** The recogniser is unusable. Distinct from the user saying nothing. */
   onError: (message: string) => void
+  /** Actual engine startup/failure, separate from transient transcription errors. */
+  onStatus?: (status: 'ready' | 'wake-ready' | 'blocked' | 'unavailable') => void
 }
 
 export type Voice = {
@@ -393,23 +395,33 @@ if (typeof window !== 'undefined') {
  */
 export async function startVoice(h: VoiceHandlers): Promise<Voice> {
   let stream: MediaStream
-  try { stream = await getMic() } catch {
-    h.onError('Microphone unavailable or denied. Typed chat remains available; enable voice to retry.')
+  try { stream = await getMic() } catch (error) {
+    h.onStatus?.((error as DOMException)?.name === 'NotAllowedError' ? 'blocked' : 'unavailable')
+    h.onError('Microphone unavailable or denied. Typed chat remains available; use Retry voice after checking browser permission.')
     return { stop: () => {}, reset: () => {}, live: () => false }
   }
   const controller = new AbortController()
   let stopped = false, detector: import('./wake').WakeDetector | null = null
+  let browserWakeReady = false
   let cloud: Voice | null = null
   const sync = () => { browser.sync?.(); cloud?.sync?.(); detector?.sync() }
   const handlers = { ...h, onWake: (text: string) => { h.onWake(text); sync() } }
-  const browser = startBrowserVoice({ ...handlers, onError: message => { if (!caps().stt) h.onError(message); else diag.lastError = 'browser wake unavailable; Space still works' }, mode: () => {
+  const browser = startBrowserVoice({ ...handlers,
+    onStatus: status => {
+      browserWakeReady = status === 'wake-ready'
+      if (status === 'ready' || status === 'wake-ready' || !caps().stt) h.onStatus?.(status)
+    },
+    onError: message => { if (!caps().stt) h.onError(message); else diag.lastError = 'browser wake unavailable; Space still works' }, mode: () => {
     const mode = h.mode()
     if (mode === 'wake') return detector ? 'deaf' : 'wake'
     return caps().stt ? 'deaf' : mode
   } }, stream)
   if (caps().stt) {
     diag.engine = 'elevenlabs'
-    cloud = await startElevenVoice({ ...handlers, mode: () => h.mode() === 'wake' ? 'deaf' : h.mode() })
+    try {
+      cloud = await startElevenVoice({ ...handlers, mode: () => h.mode() === 'wake' ? 'deaf' : h.mode() })
+      if (cloud.live()) h.onStatus?.(browserWakeReady ? 'wake-ready' : 'ready')
+    } catch (error) { controller.abort(); browser.stop(); throw error }
   }
   // Optional setup never blocks command capture or application readiness.
   void voiceSetting('settings', 'GET', undefined, controller.signal).then(async config => {
@@ -419,7 +431,7 @@ export async function startVoice(h: VoiceHandlers): Promise<Voice> {
       if (!stopped) { diag.wakes++; h.onWake(''); sync() }
     }, () => { detector = null; diag.wakeEngine = 'browser fallback'; sync() }, controller.signal)
     if (stopped) { local.stop(); return }
-    detector = local; diag.wakeEngine = 'porcupine'; sync()
+    detector = local; diag.wakeEngine = 'porcupine'; sync(); h.onStatus?.('wake-ready')
   }).catch(() => { if (!stopped) { diag.wakeEngine = 'browser fallback'; sync() } })
   sync()
   return {
@@ -604,6 +616,7 @@ async function startElevenVoice(h: VoiceHandlers): Promise<Voice> {
       if (stopped) return
       diag.lastError = 'capture'
       diag.running = false
+      h.onStatus?.('unavailable')
       h.onError(message)
     },
   })
@@ -650,6 +663,7 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
   const Ctor =
     (window as any).SpeechRecognition ?? (window as any).webkitSpeechRecognition
   if (!Ctor) {
+    h.onStatus?.('unavailable')
     h.onError('This browser has no speech recognition — use Chrome or Edge, or add an ElevenLabs key.')
     return { stop: () => {}, reset: () => {}, live: () => false }
   }
@@ -658,6 +672,8 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
   let running = false
   let rec: any = null
   let restartTimer: ReturnType<typeof setTimeout> | null = null
+  let startupTimer: ReturnType<typeof setTimeout> | null = null
+  let health: ReturnType<typeof setInterval> | null = null
   let settled = ''
   let interim = ''
   let started = false
@@ -815,9 +831,12 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
     rec.lang = 'en-GB'
     rec.onstart = () => {
       if (stopped || rec !== recognizer) return
+      if (startupTimer) clearTimeout(startupTimer)
+      startupTimer = null
       running = true
       diag.running = true
       diag.sessions++
+      h.onStatus?.(h.mode() === 'wake' ? 'wake-ready' : 'ready')
       touch()
     }
     rec.onresult = (event: any) => { if (!stopped && rec === recognizer) onResult(event) }
@@ -825,8 +844,8 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
       if (stopped || rec !== recognizer) return
       diag.lastError = String(ev.error ?? '')
       if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-        stopped = true
-        diag.running = false
+        stop()
+        h.onStatus?.('blocked')
         h.onError('Microphone access was refused — voice input is unavailable.')
       }
     }
@@ -841,8 +860,9 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
     try {
       try { rec.start(stream.getAudioTracks()[0]) } catch { rec.start() }
     } catch {
-      running = false
-      restartTimer = setTimeout(spin, 250)
+      stop()
+      h.onStatus?.('unavailable')
+      h.onError('Browser speech could not start. Use Retry voice or typed chat.')
     }
   }
 
@@ -858,11 +878,28 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
     if (!stopped && h.mode() !== 'deaf') restartTimer = setTimeout(spin, 80)
   }
 
+  const stop = () => {
+    stopped = true
+    resetInput()
+    if (restartTimer) clearTimeout(restartTimer)
+    if (startupTimer) clearTimeout(startupTimer)
+    if (health) clearInterval(health)
+    startupTimer = null; health = null
+    clearSilence(); assemble.cancel(); diag.running = false
+  }
+
+  // Some engines accept start() but never emit onstart/onerror. A one-shot
+  // startup deadline exposes that failure; it is not another polling loop.
+  startupTimer = setTimeout(() => {
+    if (stopped) return
+    stop(); h.onStatus?.('unavailable')
+    h.onError('Browser speech did not start. Use Retry voice or typed chat; check browser microphone and speech-service access.')
+  }, 4000)
   spin()
 
   // The heartbeat. If nothing has been heard from the engine for a while it has
   // gone quiet on us — tear it down and build a fresh one.
-  const health = setInterval(() => {
+  if (!stopped) health = setInterval(() => {
     if (stopped || h.mode() === 'deaf') return
     const idle = Date.now() - lastAlive
     diag.idleMs = idle
@@ -875,20 +912,7 @@ function startBrowserVoice(h: VoiceHandlers, stream: MediaStream): Voice {
   return {
     sync: () => { if (h.mode() === 'deaf') { if (running) resetInput() } else spin() },
     reset: resetInput,
-    stop: () => {
-      stopped = true
-      resetInput()
-      if (restartTimer) clearTimeout(restartTimer)
-      clearInterval(health)
-      clearSilence()
-      assemble.cancel()
-      diag.running = false
-      try {
-        rec?.abort()
-      } catch {
-        /* noop */
-      }
-    },
+    stop,
     live: () => !stopped,
   }
 }

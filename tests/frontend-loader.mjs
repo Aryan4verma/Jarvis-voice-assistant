@@ -1,12 +1,14 @@
 // Test-only browser/provider doubles. Production modules never load this file.
 import { readFile, stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import { transpileModule, ModuleKind } from 'typescript'
+import { transpileModule, ModuleKind, JsxEmit } from 'typescript'
 
 export async function resolve(specifier, context, next) {
-  if (specifier.startsWith('.') && context.parentURL && new URL(context.parentURL).pathname.endsWith('.ts')) {
-    const url = new URL(specifier + (specifier.endsWith('.ts') ? '' : '.ts'), context.parentURL)
-    try { if ((await stat(url)).isFile()) return { url: url.href, shortCircuit: true } } catch { /* normal resolution */ }
+  if (specifier.startsWith('.') && context.parentURL && /\.tsx?$/.test(new URL(context.parentURL).pathname)) {
+    for (const suffix of /\.tsx?$/.test(specifier) ? [''] : ['.ts', '.tsx']) {
+      const url = new URL(specifier + suffix, context.parentURL)
+      try { if ((await stat(url)).isFile()) return { url: url.href, shortCircuit: true } } catch { /* normal resolution */ }
+    }
   }
   return next(specifier, context)
 }
@@ -23,9 +25,10 @@ export async function load(url, context, next) {
   for (const [suffix, source] of Object.entries(fixtures)) {
     if (!new URL(url).search && new URL(url).pathname.endsWith(suffix)) return { format: 'module', source, shortCircuit: true }
   }
-  if (url.startsWith('file:') && new URL(url).pathname.endsWith('.ts')) {
-    return { format: 'module', shortCircuit: true, source: transpileModule(await readFile(fileURLToPath(url), 'utf8'),
-      { compilerOptions: { module: ModuleKind.ESNext, target: 10 } }).outputText }
+  if (url.startsWith('file:') && /\.tsx?$/.test(new URL(url).pathname)) {
+    const source = (await readFile(fileURLToPath(url), 'utf8')).replaceAll('import.meta.env.DEV', 'false')
+    return { format: 'module', shortCircuit: true, source: transpileModule(source,
+      { compilerOptions: { module: ModuleKind.ESNext, target: 10, jsx: JsxEmit.ReactJSX }, fileName: fileURLToPath(url) }).outputText }
   }
   return next(url, context)
 }
