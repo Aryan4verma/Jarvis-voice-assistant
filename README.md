@@ -1,430 +1,206 @@
-# J.A.R.V.I.S.
+# JARVIS — holographic personal assistant
 
-A browser voice assistant with an Iron Man holographic interface. Windows AI
-Settings supports OpenRouter, OpenAI, Google Gemini and the existing Claude Agent
-login. See [Phase 7 setup, startup and validation](PHASE7.md). Say
-**"Hey Jarvis"**, he wakes, listens, and does real things through your tools —
-searches the web, generates images, drives your phone, reads your mail. The face
-is a web page (React + Vite + Three.js + custom GLSL). The original agent brain is Claude Code,
-run headless as a library.
+An independent personal assistant customized by Aryan Verma from
+[Aditya Dewaskar's JARVIS](https://github.com/adewaskar/jarvis). It combines typed
+and voice chat, a cyan holographic interface and cloud inference through an
+authenticated local Node bridge. It is a modified derivative, not a new project
+built entirely from scratch. [Attribution](ATTRIBUTION.md) · [MIT license](LICENSE).
 
-**Claude Agent mode reuses your Claude Code subscription.** Alternatively,
-configure a cloud provider key in AI Settings. Provider charges depend on your
-chosen account/model; there is no automatic paid fallback. In Claude mode the
-brain runs on your existing Claude Code login, and
-the heavy work (the model itself) runs on Anthropic's servers, so even a low-end
-laptop only has to draw the interface. **ElevenLabs is an optional add-on** that
-gives JARVIS a much better voice and sharper hearing; without it he speaks and
-listens through the browser's own speech, and everything still works.
+## Main features
 
----
+- Typed chat with Enter/Send, streaming replies and STOP/Escape cancellation.
+- Voice commands with browser recognition, system speech and sentence streaming;
+  Space is push-to-talk. Optional ElevenLabs STT/TTS and Picovoice Porcupine wake
+  detection use Voice Settings. “Hey Jarvis” uses browser recognition by default;
+  optional Porcupine detects its built-in “Jarvis” keyword.
+- Backend OpenRouter, OpenAI Responses API and Google Gemini adapters, plus the
+  existing Claude Agent SDK mode. Selected-model capabilities gate vision/tools.
+- Separate Windows-protected provider keys and FAST/BALANCED/DEEP model mappings.
+  Catalogs load on request; manual IDs remain available. OpenRouter has Free,
+  Vision and Tools filters and explicit `openrouter/free` selection.
+- Two-clap ignition, click/Space fallbacks and a concurrent ~3.2-second terminal
+  boot. Browser permission/autoplay rules apply. Sounds are synthesized; no music
+  recordings ship in the current tree.
+- Lazy 3D startup and ECO defaults: DPR 1, ~30 FPS while active, settled standby
+  and hidden-tab rendering suspension. Camera/gestures are opt-in.
+- Existing display/UI/camera tools, authenticated media/file serving and
+  event-based latency diagnostics. External/browser tool availability differs
+  between providers; see the table below.
 
-## Requirements
+## Hardware target and requirements
 
-**In one line:** Node.js and Chrome/Edge, plus either a configured cloud-provider
-key or the existing Claude Code login.
+Development targets a Windows 64-bit laptop with an Intel i3-class CPU, 8 GB RAM
+and integrated graphics. These are optimization targets, not measured minimum
+requirements or a promise of a particular RAM/FPS budget. Cloud inference avoids
+local LLM loading; optional neural TTS/hand tracking/wake features still cost
+resources and can remain disabled.
 
-- **Claude Agent mode: Claude Code, installed and logged in** — native API modes
-  use their provider key instead.
-  Install it with the official method — `npm install -g @anthropic-ai/claude-code`,
-  or the platform installer at <https://docs.claude.com/en/docs/claude-code> —
-  then run `claude` once and complete login. The bridge reuses that login. **No
-  API key**, and usage is billed to your existing Claude account.
-- **Node.js `^20.19.0 || >=22.12.0`** — Node 20 requires 20.19 or newer;
-  otherwise use 22.12 or newer. **Node 24 LTS is recommended.** This matches
-  the locked Vite, React plugin, and lint tooling. A supported installed version
-  does not need to be changed. Installers are at <https://nodejs.org>.
-- **Google Chrome or Microsoft Edge**, in a **real browser window** — not an
-  embedded preview pane. Preview panes (including the one inside editors and
-  Claude Code) block microphone access, so the page loads and looks right but
-  never hears you. JARVIS also needs WebGL, which these browsers provide.
-- **Optional: an ElevenLabs API key** — a good add-on, not a requirement. It
-  gives a better voice and sharper transcription; the free tier is plenty for a
-  demo. Without it, everything runs on the browser's own speech.
+Use Node.js **`^20.19.0 || >=22.12.0`**, npm, and a normal Chrome/Edge window.
+Microphone and camera need browser permission; typed chat remains available if
+voice fails. Choose an API-provider account/key or your independently configured
+Claude Agent authentication. Optional integrations need their own setup and terms.
 
-Run `npm run setup` after cloning and it checks all of this for you, in plain
-language.
+## Install and run
 
----
-
-## Quick start
-
-First, install, then start it:
-
-```bash
-npm ci             # reproducible installation from package-lock.json
-npm start          # runs the brain and the face together
-```
-
-Then open the URL it prints (http://localhost:5173) in **Chrome**. Click **INITIALISE** or press Space. For double-clap activation, click **Enable double-clap** once to authorize the shared microphone; future starts arm automatically when browser permissions allow it. Say **“Hey Jarvis”** after startup.
-
-Prefer two terminals? Run them separately instead:
-
-```bash
-npm ci
-```
-
-Terminal 1 — the brain:
-
-```bash
-npm run bridge
-```
-
-Terminal 2 — the face:
-
-```bash
-npm run dev
-```
-
-Then open the app in a **real Chrome or Edge window**. On Windows PowerShell:
+From the folder containing `package.json` (currently `jarvis`):
 
 ```powershell
-Start-Process http://localhost:5173
-```
-
-Click **INITIALISE**, allow the microphone when asked, and say **"Hey Jarvis"**.
-
-> It has to be a real browser window. Embedded preview panes block the
-> microphone, so JARVIS will look perfectly alive and simply never respond.
-
-### Windows development/build baseline
-
-Run these commands from the repository directory:
-
-```bash
 npm ci
-npm run setup
-npm run build      # TypeScript project checks, then the production bundle
-npm run lint
 npm start
 ```
 
-`npm start`, `npm run bridge`, and `npm run bridge:writes` use Node directly;
-the write-mode command does not require Unix environment-variable syntax.
-Ctrl-C stops the launcher and its two direct children. Full cleanup of optional
-agent/MCP descendant processes is a separate lifecycle concern.
+Open the local URL printed by the launcher (normally `http://localhost:5173`).
+Click **INITIALISE** or press **Space**. For double-clap ignition, use **Enable
+double-clap** once to authorize the shared microphone/audio; already granted
+permission may allow later starts to arm automatically. Clap detection runs only
+while offline and retires immediately at startup. Permission does not override
+browser autoplay restrictions.
 
-MediaPipe's pinned JavaScript/WASM runtime is prepared automatically for
-`start`, `dev`, `build`, and `preview`. The generated `public/mediapipe` directory
-is ignored by Git and copied into production output. Unchanged assets are reused;
-missing or incomplete assets are repaired. Optional hand-model weights still
-need network access when not already cached.
+For separate terminals, use `npm run bridge` and `npm run dev`. `npm run setup`
+is an advisory preflight, not a credential/permissions test. MediaPipe runtime
+assets and legal notices are prepared for normal Vite workflows. `npm run preview`
+serves the built frontend through the local broker; run the bridge separately.
+An unrelated static host cannot replace that broker. Ctrl-C stops the launcher
+and its direct children; optional MCP descendant cleanup is not fully redesigned.
 
-`npm run preview` serves the production frontend; start `npm run bridge` in a
-second terminal for AI requests. Run `npm run test:security` for the focused
-bridge security suite; there is no full application end-to-end suite.
-Run `npm run test:lifecycle` for deterministic turn, cancellation, speech,
-camera, retry, and disconnect tests without AI credentials. See
-[TURN_LIFECYCLE.md](TURN_LIFECYCLE.md) for ownership and cancellation guarantees.
-Setup is advisory and does not establish Claude login or microphone/camera
-permissions. The existing Chrome native-host transport still assumes Unix
-sockets; Windows browser automation remains a later compatibility task.
+## Provider setup
 
----
+Open **AI Settings**, select a provider and save/replace its key through the
+password field. The stored key is never revealed. Pick FAST/BALANCED/DEEP models,
+then **Save AI Settings** to activate them. **Test Connection** activates the
+draft and checks key/model metadata without paid inference. Provider switching
+preserves other providers' keys and mappings and cancels any active interaction.
 
-## How it works
+Catalogs are explicit, bounded requests with a small RAM cache. Unknown model
+capabilities stay unknown; specialized endpoints may be unsupported. OpenRouter
+needs Load catalog/Test Connection again after a bridge restart for verified
+vision/tools, except its documented Free Router contract. Free status requires
+known zero pricing; models are never silently switched to paid alternatives.
+There is no automatic provider fallback or polling. Account charges, quotas and
+model access remain controlled by each provider.
 
-JARVIS is two processes. The browser is the face and the voice; the bridge is
-the brain and the hands.
+Claude Agent preserves the existing SDK and its own CLI authentication. Install
+and authenticate Claude Code through [Anthropic's official instructions](https://code.claude.com/docs/en/overview)
+if using that mode. JARVIS does not collect Claude account passwords/OAuth tokens.
+Usage eligibility/billing and redistribution follow [Anthropic's terms](https://code.claude.com/docs/en/legal-and-compliance),
+not this repository's MIT license. No subscription or unlimited-use guarantee is made.
 
-```
-  ┌─ browser (the face) ───────────────┐        ┌─ bridge (the brain) ─────────────┐
-  │  "Hey Jarvis" wake word            │        │  Node · bridge/server.mjs        │
-  │  local VAD  →  speech to text      │   ws   │  Claude Agent SDK                │
-  │  reactor UI (Three.js + GLSL)      │◄─────► │   = Claude Code, headless        │
-  │  text to speech                    │  8787  │  spawns your MCP servers         │
-  │  heads-up display                  │        │  permission gate (decideTool)    │
-  └────────────────────────────────────┘        └──────────────────────────────────┘
-```
+[Multi-provider details](PHASE7.md) · [AI contracts](AI_PROVIDERS.md) ·
+[OpenRouter settings](OPENROUTER_SETTINGS.md).
 
-Everything you see and hear happens in the browser. The bridge is a single Node
-process (`bridge/server.mjs`) that runs the **Claude Agent SDK**
-(`@anthropic-ai/claude-agent-sdk`) — this spawns the real `claude` CLI as a child
-process, so **the brain literally is Claude Code, headless.** They talk over a
-WebSocket (plus a few HTTP endpoints) on `127.0.0.1:8787`, reached through
-Vite's authenticated same-origin broker.
+## Tools and Windows browser status
 
-**Why a bridge at all?** A browser tab cannot spawn the local stdio MCP servers —
-`higgsfield`, `elevenlabs`, `android`, `playwright`, `exa`, `serper`, and the
-rest. The bridge can. And because it is the Agent SDK, it authenticates off your
-existing Claude Code login: no API key, billed to that same Claude account.
+| Mode / component | What the current code supplies | Limits |
+| --- | --- | --- |
+| OpenRouter / OpenAI / Gemini | Validated JARVIS display, interface and supported camera function handlers | Requires verified model tool/vision capabilities; no arbitrary MCP, filesystem, phone, email or browser-control functions supplied. |
+| Claude Agent | Existing agent runtime plus configured MCP servers from the user's `.claude.json`, and local display/UI/vision/browser servers | Availability depends on installed tools, credentials and SDK permission behavior. These external integrations were not live-verified in this polishing pass. |
+| Custom Chrome transport (`bridge/chrome.mjs`) | Discovery/connect code for `/tmp/claude-mcp-browser-bridge-<user>/<pid>.sock` | Unix socket/native-host assumption remains. Native Windows Chrome/Edge control is **incomplete and unverified**; there is no Windows named-pipe implementation here. |
+| External browser MCP | User-configured servers can be passed to Claude Agent | The current Claude persona directs browsing through the custom Chrome tools and discourages Playwright/Puppeteer. Configuring a server alone is not proof that Windows browser actions work. |
+| HTTP page/media reader | Guarded backend URL/file retrieval and sanitized display | Fetching public content is not native browser control or authenticated browser-session access. |
 
-**The model.** `claude-opus-5` at effort `medium` by default. Override with the
-`JARVIS_MODEL` and `JARVIS_EFFORT` environment variables. On startup the bridge
-prints its choice, e.g. `[jarvis] model claude-opus-5 · effort medium`.
+`npm run bridge:writes` broadens existing effectful-tool permissions; it does
+not implement missing integrations. The permission callback is not a complete
+sandbox: SDK auto-approved actions can bypass it. Review `decideTool` and your
+MCP configuration before enabling writes. No new browser transport is implemented.
 
-### The voice pipeline
+## Voice and controls
 
-Space enters listening immediately after initialization, with no greeting. One
-shared microphone uses echo cancellation and noise suppression. There is no
-microphone capture before initialization unless you explicitly authorize the
-offline double-clap gate (or the browser has already granted it). WebGL loads
-after the lightweight cinematic. The 3.2-second DOM/CSS/SVG presentation runs
-alongside real initialization; chat and voice do not wait for it. Two sharp
-claps 180–900 ms apart ignite JARVIS, then clap analysis retires immediately.
-Browser autoplay policies still apply. Ambient startup music remains off.
+| Control | Behavior |
+| --- | --- |
+| “Hey Jarvis” / configured wake engine | Start command listening after initialization |
+| Space | Initialize or enter push-to-talk listening |
+| Enter / Send | Submit typed chat |
+| STOP / Escape / barge-in | Cancel the owned interaction and speech; Escape also dismisses the boot |
+| V | Cycle system voices |
+| D | Latest-interaction latency diagnostics |
+| T | Audio self-test |
+| G | Optional hand interaction |
 
-**Voice Settings** configures optional ElevenLabs Scribe and Picovoice keys in
-Windows CurrentUser DPAPI storage outside the repository. Scribe transcribes
-commands/interruptions only, never standby room audio. Browser SpeechRecognition
-remains the fallback (its service may send audio to the browser vendor). Modern
-Chrome/Edge can use the shared audio track; older browsers may own internal
-recognition capture. Missing microphone permission keeps typed chat available.
+Voice Replies defaults to Always; Voice requests only and Off are available.
+Voice Settings stores optional voice credentials under Windows protection.
+Browser recognition may send audio to the browser vendor. ElevenLabs audio goes
+to ElevenLabs when used; command STT does not continuously upload standby room
+audio. Picovoice's Web SDK must receive its AccessKey transiently in its worker
+and can perform vendor license checks. Optional Kokoro is explicitly selected
+and has separate resource/distribution limits. [Voice/performance details](VOICE_PERFORMANCE.md).
 
-Optional Porcupine detects the built-in “Jarvis” keyword locally on one CPU
-thread, then command recognition takes over. Its model downloads once when
-configured and is cached by the SDK. The AccessKey is encrypted at rest but the
-Web SDK necessarily receives it inside its worker at runtime. It is never saved
-in localStorage, source, or configuration. AI/ElevenLabs keys remain backend-only.
-Optional wake setup fails back to browser recognition without blocking startup.
+## Security and privacy
 
-**Voice Replies** defaults to **Always** for both typed and voice requests;
-**Voice requests only** and **Off** are available. Responses stream sentences
-through system speech by default. `VITE_USE_ELEVENLABS=true` opts into cloud TTS;
-otherwise a configured cloud voice is only a rescue for failed native speech.
-Kokoro remains explicitly optional. STOP/Escape cancel the same owned turn,
-including queued audio. Native speech failure is reported instead of silently
-waiting or contacting an unconfigured cloud service.
+AI/ElevenLabs keys remain backend-only and are stored outside Git/config JSON
+using **Windows CurrentUser DPAPI**, under `%LOCALAPPDATA%\JarvisAI\credentials`.
+Non-secret preferences live in `%LOCALAPPDATA%\JarvisAI\settings`. No permanent
+AI key belongs in a `VITE_*` variable, localStorage, a URL or committed file.
+DPAPI protects at rest for that Windows user; it does not protect against malware
+running as that same user or an administrator. Secret storage fails closed on
+unsupported platforms; Claude Agent remains an option.
 
-ECO retains the holographic 3D design with lazy loading, DPR 1, approximately
-30 FPS while active, half-resolution bloom, and no chromatic aberration/noise.
-Standby freezes after a short settling burst; hidden tabs render no frames.
-First paint, shader initialization and graphics failure use an opaque dark
-background. Camera and gestures remain opt-in. Press **D** for event-based
-latest-interaction latency diagnostics; press **T** for an audio-only test.
+The bridge binds to `127.0.0.1`; authenticated HTTP/WebSocket requests use a Node
+broker and an origin-bound HttpOnly/SameSite browser session. Bridge bearer
+credentials stay on Node. `/health` only reports `{"ok":true}`. SSRF, size,
+path/realpath and markup guards remain. File access is limited to private runtime
+artifacts or narrow configured `JARVIS_FILE_ROOTS`; drive/home/temp roots are not
+approved. This application is local software, not a LAN/cloud hosting service.
 
-Readiness describes configuration, not live provider validation. No provider
-API polling, paid fallback, or automatic effectful request replay is added.
-See [VOICE_PERFORMANCE.md](VOICE_PERFORMANCE.md) for details and limitations.
+Private runtime records use `%LOCALAPPDATA%\JarvisAI\bridge\<checkout-id>`.
+AI messages and optional camera images go to the selected provider; provider
+retention/terms apply. Google Fonts requests expose normal request metadata.
+Logs omit raw credentials, transcripts and provider error bodies. There is no
+SQLite/persistent personal memory implementation. Conversation text in the UI
+is temporary; an agent may manage its own session data outside this repository.
 
----
+Ignore rules cover environment secrets, DPAPI blobs, databases, settings,
+transcripts, captures, recordings, logs, dependencies and generated outputs.
+Ignore rules do not sanitize already tracked history or files copied into a
+build. Never commit private MCP configuration or public-directory overrides.
 
-## What JARVIS can do
+## Known limitations
 
-Beyond answering, JARVIS reaches every MCP server in your Claude Code
-configuration, and can drive his own interface.
+- Native Windows browser automation remains incomplete, as described above.
+- No real paid-provider generation, physical clap accuracy, actual speaker output
+  or numerical low-end hardware budget was verified by the automated suites.
+- Permission/autoplay restrictions and browser speech availability vary; use
+  INITIALISE, Space or typed chat when optional features fail.
+- STOP aborts supported requests and quarantines stale output. It cannot undo
+  completed external actions or prove remote computation/billing stopped.
+- Model-list metadata is incomplete. Metadata tests do not prove every inference
+  permission; quota/network/busy/model failures can still occur.
+- Existing optional chunks are large. Neural TTS and gestures are optional;
+  default cloud AI does not load a local LLM.
+- **Compiled-release licensing is not fully cleared.** Claude/Picovoice terms,
+  embedded eSpeak NG in the optional Kokoro path, native transitive libraries and
+  separately downloaded models need distribution review. See the notices below.
+  Do not advertise an installer/bundle as entirely MIT-licensed.
 
-### Your tools
+## Validation
 
-Every server in your `~/.claude.json` is handed to the SDK explicitly. Depending
-on what you have installed, that is roughly:
-
-- **Web & search** — `exa`, `serper`, `serpapi`
-- **Images & video** — `higgsfield`, `openrouter-image`, `palmier-pro`
-- **Voice** — `elevenlabs`
-- **Your phone** — `android`
-- **The browser** — `playwright`
-
-A few things you can say:
-
-- *"What's happening in AI this week?"*
-- *"Generate an image of the Mark VII suit."*
-- *"Take a screenshot of my phone."*
-- *"Open my GitHub notifications."*
-
-> **Note on account connectors.** Servers you added through your **claude.ai
-> account** are not stored on disk, so the bridge cannot see them — it works from
-> the servers in `~/.claude.json` (about 14), not the claude.ai ones.
-
-### JARVIS controls the interface
-
-He drives the UI through MCP tools the bridge exposes:
-
-- `ui_theme` — accent, background, per-phase colours
-- `ui_reactor` — colour, scale, intensity, spin, and style (`ring` | `sphere` | `wire`), visibility
-- `ui_orbit` — put images in orbit around the reactor
-- `ui_chrome` — show or hide rails, transcript, badges
-- `ui_effect` — `glitch` | `pulse` | `scan` | `shake` | `flash`
-- `ui_screen` — clear
-- `ui_reset` — back to defaults
-
-So *"make it red, hide the systems list, put that render in orbit"* is a spoken
-command.
-
-### The heads-up display
-
-JARVIS authors panels with a `display` tool against a fixed `.hud-*` design
-system. The browser sanitises the markup (DOMPurify, a class allowlist and a
-strict CSP) before rendering. Rich media works — images, `<video>`, and
-YouTube/Vimeo embeds. Remote images and video are fetched **server-side** through
-the bridge (`/img` and `/media`, both SSRF-guarded), so hotlink-blocked news
-thumbnails still appear and the page never beacons your IP to a host the model
-chose.
-
----
-
-## Controls
-
-| Key / phrase | Does |
-|---|---|
-| **"Hey Jarvis"** | Wake him |
-| **Space** | Talk without the wake word |
-| Just speak | Interrupt him mid-sentence (barge-in) |
-| **V** | Cycle the browser voice |
-| **Escape** | Stand down |
-| **D** | Live diagnostics panel |
-| **T** | One-line audio self-test |
-
----
-
-## The boot sequence
-
-Power-up plays a four-beat Iron Man start-up (`src/ui/Boot.tsx`): an
-"INITIATING SYSTEM" status bar with a segmented progress bar and boot log; then
-concentric reticle rings resolving into "J.A.R.V.I.S"; then a suit schematic;
-then the triangular arc reactor lighting up — with a start-up sound under it
-(`public/audio/boot-music.mp3`).
-
----
-
-## Configuration
-
-Everything is optional in bridge mode. Frontend settings live in `.env.local`
-(copy `.env.example`); bridge settings are environment variables.
-
-### AI settings and typed chat
-
-Open **AI Settings** to choose OpenRouter, OpenAI, Google Gemini or Claude Agent,
-save separate Windows-protected provider keys, select
-FAST/BALANCED/DEEP model mappings, and test the connection. Typed chat works
-without enabling voice. Enter sends; STOP/Escape cancels. Claude Agent remains
-available. Model catalogs load on request; OpenRouter offers search, Free only,
-Vision and Tools filters plus explicit `openrouter/free` selection. See
-[multi-provider setup and security](PHASE7.md) and
-[OpenRouter details](OPENROUTER_SETTINGS.md).
-Browser-direct AI credentials are retired.
-
-### Bridge
-
-| Variable | Default | Effect |
-|---|---|---|
-| `JARVIS_BRIDGE_PORT` | `8787` | Port for the WebSocket + HTTP endpoints |
-| `JARVIS_MODEL` | `claude-opus-5` | Model to run |
-| `JARVIS_EFFORT` | `medium` | Reasoning effort |
-| `JARVIS_ALLOW_WRITES` | off | `1` allows effectful tools (see below) |
-| `JARVIS_ALLOWED_ORIGINS` | local dev | Extra WebSocket origins to accept |
-| `JARVIS_ALLOW_NO_ORIGIN` | off | Accept authenticated WebSockets with no `Origin` header |
-| `JARVIS_FILE_ROOTS` | private artifacts | Extra narrow local artifact directories for `/file` |
-| `JARVIS_VOICE_ID` | — | ElevenLabs voice id |
-| `ELEVENLABS_API_KEY` | — | Optional; enables the ElevenLabs voice + Scribe |
-
-### Frontend (`.env.local`)
-
-| Variable | Effect |
-|---|---|
-| `VITE_BRIDGE_URL` | Local bridge port used by the Node broker; remote hosts are refused |
-| `VITE_TTS_ENGINE` | `system` or `kokoro` |
-| `VITE_KOKORO_VOICE` | Voice for the Kokoro engine |
-| `VITE_USE_ELEVENLABS` | Force the ElevenLabs voice on |
-
-### Adding an ElevenLabs key
-
-You do not have to touch a flag. Either:
-
-- Set `ELEVENLABS_API_KEY` on the bridge before starting it, **or**
-- Add the key to your `elevenlabs` MCP server's env in `~/.claude.json` — the
-  bridge reads it from there too.
-
-Either way, authenticated `/readiness` reports speech as configured, the browser
-picks it up on the next boot, and both voice and transcription are selected
-automatically. External service access is validated by actual use.
-
----
-
-## Enabling actions
-
-The tool gate starts **read-only**. Search, generation and lookups run freely;
-anything effectful — send, tap, delete, install, pay — is denied. Voice is a poor
-interface for a confirmation dialog, so the decision is made ahead of time in
-`decideTool()` in `bridge/server.mjs`, not at the moment of use. The bridge sets
-`settingSources: []`, so filesystem settings and global allow-rules are not
-loaded. This callback is not a complete
-tool sandbox: SDK auto-approved tools can bypass it. A stronger tool-permission
-architecture is a later phase.
-
-To allow effectful tools (phone, browser driving, sending), run the bridge this
-way instead:
-
-```bash
-npm run bridge:writes
+```powershell
+npx tsc -b --pretty false
+npm run build
+npm run lint
+npm run test:security
+npm run test:lifecycle
+npm run test:providers
+npm run test:openrouter
+npm run test:voice
+npm run test:phase7
+git diff --check
 ```
 
-> Read `decideTool()` before you do. *"Hey Jarvis, clean up my downloads folder"*
-> means something rather different with writes enabled.
+Tests use deterministic doubles rather than paid model requests, including real
+Windows DPAPI and authenticated local bridge tests. They do not constitute a full
+live-service/hardware end-to-end certification. Keep secret scanning and staged
+file review in the publishing workflow.
 
----
+## License, attribution and disclaimer
 
-## Troubleshooting
+[LICENSE](LICENSE) preserves **Copyright (c) 2026 Aditya Dewaskar** unchanged.
+[ATTRIBUTION.md](ATTRIBUTION.md) identifies the modified derivative and Aryan
+Verma's extensions. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) records direct
+dependency licenses and unresolved distribution terms; [ASSET_AUDIT.md](ASSET_AUDIT.md)
+records retained, generated and removed assets. Dependencies retain their own
+licenses. Build/preview legal documents are served under `/legal/`.
 
-**I can't hear him, or he can't hear me.** Press **D** for the diagnostics panel
-— it states plainly whether he is hearing you and whether he is producing sound.
-Press **T** for a one-line audio self-test.
-
-**No voice at all.** You must be in **Chrome or Edge**, in a **real browser
-window** (not an embedded preview), and you must have **allowed the microphone**.
-
-**Bridge not reachable.** Check that `npm run bridge` is still running in its
-terminal, and that nothing else is holding port `8787`.
-
----
-
-## Local bridge security
-
-The bridge binds explicitly to `127.0.0.1`. Both HTTP and WebSocket requests
-validate the local Host, and sensitive requests require a randomly generated
-bearer credential. `/health` is intentionally public and returns only
-`{"ok":true}`; authenticated `/readiness` distinguishes configuration from actual
-validation. It performs no periodic cloud checks or authentication probe.
-
-Vite's local dev/preview broker initializes an HttpOnly, SameSite=Strict,
-origin-bound browser session through a same-origin POST. It keeps the bridge
-bearer on the Node side and forwards authenticated, streaming requests. The
-bearer is never included in frontend bundles, URLs, localStorage, or logs.
-Browser session cookies contain a derived credential, not the bridge bearer.
-The browser must use this local dev/preview workflow in bridge mode; serving
-the built frontend on an unrelated static host is not supported in bridge mode.
-`VITE_BRIDGE_URL` can select a local bridge port, not a remote bridge host.
-
-Private runtime records live beneath `%LOCALAPPDATA%\JarvisAI\bridge\<checkout-id>`
-on Windows, or `~/.local/share/JarvisAI/bridge/<checkout-id>` elsewhere. Each
-bridge port has a per-process credential, rotated at restart; stale records
-with a dead PID are refused. File permissions use the private user-profile
-directory and restrictive POSIX modes where supported. This protects against
-LAN access and unrelated websites, not malware/admin processes running with
-access to the same user's files/browser. Keep user-profile ACLs private.
-
-`/file`, `/img`, `/media`, `/page`, `/tts`, `/stt`, `/readiness`, and WebSocket
-`/`/`/ws` require authentication. Sandboxed reader images use ten-minute grants
-bound to one `/img` URL; these grant no file, speech, or agent access. Referrers
-are suppressed. URL schemes, private/loopback addresses, DNS rebinding,
-redirects, size limits, DOMPurify, and realpath checks remain guarded.
-
-Local images must be in the private runtime `artifacts` subfolder, or an existing
-narrow directory explicitly listed in the bridge shell's `JARVIS_FILE_ROOTS`.
-Home, temp, and drive roots are no longer approved. UNC/device paths are refused
-before filesystem access. Tools that produce images elsewhere must be configured
-to use an approved output directory, or that specific folder must be approved.
-Do not place credentials or unrelated personal images in these directories.
-
-Default limits are one agent/WebSocket session, eight authenticated HTTP requests,
-six proxies/file reads, one STT request, and two TTS requests at a time, plus a
-120-request/minute budget. `JARVIS_MAX_SESSIONS`, `JARVIS_MAX_HTTP`,
-`JARVIS_MAX_PROXIES`, `JARVIS_MAX_STT`, `JARVIS_MAX_TTS`, and
-`JARVIS_REQUESTS_PER_MINUTE` adjust them within bounded ranges. Excess work gets
-429; WebSocket payloads and input queues are capped. Speech calls have deadlines.
-Multiple tabs share this budget; raise the session limit deliberately if needed.
-
-Logs retain operation/status information but omit raw URLs, credentials, upstream
-error bodies, transcripts, and tool inputs. Run `npm run test:security` to check
-the real local HTTP/WS transport and frontend broker using a test-only SDK double;
-the suite does not contact a model or write personal conversation transcripts.
-
----
-
-## Credits & licence
-
-MIT.
-
-The boot sound and any tracks in `public/audio/` ship with the project for the
-demo. If you go on to monetise something built on this, clearing the rights to
-that audio is your responsibility.
+This independent open-source personal project is not affiliated with or endorsed
+by Marvel, Disney, OpenAI, Google, Anthropic or other providers. Product/provider
+names belong to their respective owners. The JARVIS name is retained; a disclaimer
+does not guarantee trademark clearance or permission to republish external media.

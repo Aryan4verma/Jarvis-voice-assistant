@@ -211,7 +211,7 @@ const orbitSchema = {
     .optional()
     .catch(undefined)
     .describe(
-      'A short name you choose, e.g. "suit", "mars", "shot-1". Required to ' +
+      'A short name you choose, e.g. "core", "mars", "shot-1". Required to ' +
         'remove. On add it lets you move an object later instead of stacking a ' +
         'second copy on top of it.',
     ),
@@ -263,7 +263,7 @@ Rules that matter:
   - Three or four objects is a system. Eight is a mess and the frame stops
     reading as anything at all.
   - An orbit persists until you take it down. Clear it when the subject
-    changes — a suit render still circling during a conversation about mail is
+    changes — a system diagram still circling during a conversation about mail is
     just litter.
   - This is not a substitute for \`display\`. Orbit it when the user should
     feel it; put it in a panel when they need to look at it.`

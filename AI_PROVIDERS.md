@@ -36,9 +36,10 @@ the normalized interface.
 
 | Path | Responsibility |
 | --- | --- |
-| `bridge/providers/index.mjs` | Select Claude Agent or OpenRouter on Node; configuration changes cancel the old turn before replacing its adapter. |
+| `bridge/providers/index.mjs` | Select Claude Agent, OpenRouter, OpenAI or Gemini on Node; configuration changes cancel the old turn before replacing its adapter. |
 | `bridge/providers/claude-agent.mjs` | Claude Agent SDK query options, stream parsing, tool deduplication/status, permission callback, session resume, images, usage/errors and SDK abort/close. One instance per connection; only a successful session ID survives a turn. |
 | `bridge/providers/openrouter.mjs` | Backend streaming chat, capabilities, function continuations, usage/errors and fetch cancellation. |
+| `bridge/providers/native-chat.mjs` / `native-client.mjs` | Backend OpenAI Responses/Gemini stream translation, private tool continuation, safe errors and on-demand model metadata. |
 | `bridge/providers/openrouter-client.mjs` | Fixed OpenRouter endpoint, SSE framing and on-demand bounded model catalog. |
 | `bridge/ai-settings.mjs` / `bridge/secrets.mjs` | Safe settings DTOs and external per-user preferences/DPAPI key storage. |
 | `bridge/server.mjs` | Authenticated transport, limits, immutable turn scope and per-turn local tool services. Delegates AI events to the adapter; adds scope/turn ID to wire events. |
@@ -48,8 +49,8 @@ the normalized interface.
 
 The bridge adapter also exposes `start()` to the host, returning a result promise
 and idempotent `cancel()` receipt. Its per-operation runtime contains SDK MCP
-servers for Claude Agent or validated function handlers for OpenRouter. Existing
-display, interface and vision handlers are reused through `bridge/functions.mjs`;
+servers for Claude Agent or validated function handlers for API chat providers.
+Existing display, interface and vision handlers are reused through `bridge/functions.mjs`;
 the browser transport and external MCP architecture are preserved. Claude's
 settings isolation (`settingSources: []`), permission gate, persona, 24-turn limit
 and partial streaming remain intact. The permission callback is a last gate,
@@ -70,11 +71,14 @@ loop. Its current functions cover JARVIS display/UI and supported camera capture
 they do not imply Claude's browser, external MCP, filesystem or agent session
 capabilities. Full agent behavior requires an actual runtime/tool implementation.
 
-## Configuration and future adapters
+## Configuration
 
 All frontend AI uses the authenticated bridge. Provider/model mode selection is
 stored on Node through AI Settings. Claude model/effort retain JARVIS_MODEL and
-JARVIS_EFFORT. OpenRouter modes use user-chosen mappings and capability metadata.
+JARVIS_EFFORT. API providers keep independent user-chosen mode mappings.
+OpenAI/Gemini use documented general chat capability rules where their APIs omit
+metadata. Unknown vision/tool support is not assumed. Separate DPAPI secret slots
+are backend-only. See [Phase 7](PHASE7.md).
 See [OpenRouter settings](OPENROUTER_SETTINGS.md) for storage, supported functions,
 readiness and cancellation limitations.
 
@@ -95,8 +99,8 @@ owners. Only one primary interaction is active, including its speech tail.
 Cancellation quarantines output before requesting SDK abort and `Query.close()`.
 Receipts distinguish not-started, termination-requested and
 termination-unconfirmed; none claims remote execution or side effects were rolled
-back. OpenRouter fetch/body streams receive an operation signal linked to the original turn. A result
-that cannot terminate promptly remains quarantined. Terminal adapter cleanup
+back. All API-provider fetch/body streams receive an operation signal linked to
+the original turn. A result that cannot terminate promptly remains quarantined. Terminal adapter cleanup
 also rejects late chunks/permission callbacks. Transport timeout/disconnect uses
 the existing turn cancellation path and clears pending camera/request state.
 Bridge failures retain the Phase 3 `TurnCancelled('error')` promise behavior while

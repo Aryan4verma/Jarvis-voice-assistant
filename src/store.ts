@@ -444,7 +444,7 @@ export function accentFor(phase: Phase, ui: UiState): string {
 // the visuals from the console without talking, e.g.
 //   __jarvis.setPhase('tooling'); __jarvis.setLevel(0.8)
 //   __jarvis.applyUi({ accent: '#ff5a3c', reactor: { style: 'wire', spin: 3 } })
-//   __jarvis.addOrbit({ id: 'moon', src: '/vite.svg', radius: 0.6, speed: 8,
+//   __jarvis.addOrbit({ id: 'moon', src: '/favicon.svg', radius: 0.6, speed: 8,
 //                       size: 90, tilt: 25, opacity: 1, phase: 0 })
 //   __jarvis.fireEffect('glitch'); __jarvis.resetUi()
 if (import.meta.env.DEV) {

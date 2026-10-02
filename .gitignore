@@ -25,6 +25,7 @@ dist-ssr
 
 # Copied out of node_modules by scripts/start.mjs — 34MB of build output.
 public/mediapipe/
+public/legal/
 
 # Secrets and private machine configuration (keep the safe example tracked).
 .env
@@ -72,3 +73,17 @@ secrets.json
 .cache/
 .vite/
 *.tsbuildinfo
+
+# Encrypted secrets are still private, including copied user-profile backups.
+*.dpapi
+/credentials/
+/settings/
+/transcripts/
+/user-memory/
+*.har
+# User-supplied recordings are not licensed public project assets.
+/public/audio/*.mp3
+/public/audio/*.wav
+/public/audio/*.ogg
+/public/audio/*.m4a
+/public/audio/*.flac

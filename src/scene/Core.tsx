@@ -6,10 +6,8 @@ import type { Drive } from './Scene'
 /**
  * The reactor.
  *
- * Modelled on the JARVIS: A Second Screen Experience interface rather than on
- * the suit HUD, because that is the thing this app actually is — an assistant
- * you talk to, sitting idle and listening, not a targeting display. That
- * interface is one big COMPLETE ring: a soft teal torus with a dusty, eroded
+ * A procedural holographic system core for an assistant interface: one
+ * complete ring: a soft teal torus with a dusty, eroded
  * outer edge and a finely textured disc inside it, on near-black. There is no
  * compass, there are no gauges, and nothing is a broken arc.
  *

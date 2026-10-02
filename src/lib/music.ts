@@ -1,23 +1,7 @@
-/**
- * Score.
- *
- * Three cues, all local files under public/audio/:
- *   boot-music — the JARVIS start-up sound, once, as the reactor comes up
- *   ambient    — the opening music, once, alongside it
- *   work       — an industrial cue that loops while a tool is running
- *
- * Only `work` repeats. The other two belong to the power-up and are over when
- * it is: an interface that keeps playing music at you for as long as it is open
- * is one you end up muting, and a muted assistant loses the sounds that
- * actually carry meaning — the wake tone, the tool tick, the completion chime.
- *
- * All of it is Kevin MacLeod (incompetech.com), CC BY 4.0 — free to use with
- * attribution and safe on a monetised channel, unlike the actual film score,
- * which would be claimed within a day of upload.
- *
- * Everything degrades quietly: if a file is missing the cue simply doesn't
- * play, and the synthesised bed in sfx.ts covers the ambient case.
- */
+/** Optional private, user-supplied music cues. No recordings ship with this project.
+ * Disabled by default; normal startup uses synthesized sfx.ts tones. Add only
+ * recordings whose rights you have verified; local public/audio overrides are
+ * ignored by Git. Missing files degrade silently. */
 
 type Cue = 'boot-music' | 'ambient' | 'work'
 
@@ -48,8 +32,7 @@ let enabled = false
  *  soundtrack, and JARVIS has to stay intelligible over it. */
 const LEVEL: Record<Cue, number> = {
   // The boot cue is the JARVIS start-up sound itself, not background swell, so
-  // it sits forward — it is meant to be heard as the reactor comes up, the way
-  // the film plays it. The ambient bed underneath stays a whisper.
+  // it sits forward as a short system cue. An optional ambient bed stays quiet.
   'boot-music': 0.85,
   /**
    * Under the intro, not alongside it.

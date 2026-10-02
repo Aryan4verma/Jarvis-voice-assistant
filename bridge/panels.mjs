@@ -127,7 +127,7 @@ Headlines with their thumbnails:
 
 A video result — embedded and playable:
 <div class="hud-figure">
-  <div class="hud-embed"><iframe src="https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ" title="Flight 11, full replay" allow="accelerometer; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>
+  <div class="hud-embed"><iframe src="https://www.youtube-nocookie.com/embed/VIDEO_ID" title="Flight 11, full replay" allow="accelerometer; encrypted-media; picture-in-picture" allowfullscreen></iframe></div>
   <span class="hud-caption">SpaceX · 4:32</span>
 </div>
 
@@ -258,7 +258,7 @@ answers the question beats three that surround it.`
 const bladeSchema = {
   title: z
     .string()
-    .describe('Two to four words naming what this is, e.g. "REUTERS" or "MARK VII".'),
+    .describe('Two to four words naming what this is, e.g. "REUTERS" or "SYSTEM CORE".'),
   kind: z
     .enum(['article', 'image', 'gallery', 'video', 'embed', 'markup', 'camera'])
     .describe('What is being opened. See the tool description.'),

@@ -1,5 +1,10 @@
 # Phase 6: voice responsiveness and ECO graphics
 
+Historical milestone report. Phase 7 restores the offline shared-microphone
+double-clap gate and lightweight cinematic; the final publishing pass removes
+unverified recordings. See [README.md](README.md) for current behavior and
+[ASSET_AUDIT.md](ASSET_AUDIT.md) for asset provenance.
+
 ## Causes confirmed in code
 
 - Space called the wake greeting rather than entering a command directly.

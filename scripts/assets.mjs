@@ -4,6 +4,7 @@ import { ROOT } from './runtime.mjs'
 
 /** Prepare the pinned runtime for every Vite workflow, without a CDN download. */
 export function prepareMediaPipe() {
+  prepareLegalNotices()
   const packageDir = join(ROOT, 'node_modules', '@mediapipe', 'tasks-vision')
   const from = join(packageDir, 'wasm')
   const to = join(ROOT, 'public', 'mediapipe')
@@ -32,5 +33,21 @@ export function prepareMediaPipe() {
     console.log('[jarvis] prepared the hand-tracking runtime in public/mediapipe.')
   } catch (err) {
     throw new Error(`Could not prepare MediaPipe assets. Run npm ci and retry. ${err.message}`, { cause: err })
+  }
+}
+
+/** Keep attribution with generated assets; no runtime worker or network. */
+export function prepareLegalNotices() {
+  const to = join(ROOT, 'public', 'legal')
+  mkdirSync(to, { recursive: true })
+  for (const name of ['LICENSE', 'ATTRIBUTION.md', 'THIRD_PARTY_NOTICES.md', 'ASSET_AUDIT.md']) {
+    const bytes = readFileSync(join(ROOT, name)), target = join(to, name)
+    if (!existsSync(target) || !readFileSync(target).equals(bytes)) writeFileSync(target, bytes)
+  }
+  const licenses = join(ROOT, 'third-party-licenses'), target = join(to, 'third-party-licenses')
+  mkdirSync(target, { recursive: true })
+  for (const name of readdirSync(licenses)) {
+    const bytes = readFileSync(join(licenses, name)), file = join(target, name)
+    if (!existsSync(file) || !readFileSync(file).equals(bytes)) writeFileSync(file, bytes)
   }
 }

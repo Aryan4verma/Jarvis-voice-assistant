@@ -1,19 +1,8 @@
-/**
- * JARVIS local bridge.
- *
- * Runs the Claude Agent SDK — Claude Code as a library — and exposes one turn
- * of conversation over a WebSocket. The browser stays the face and the voice;
- * this process is the brain and the hands.
- *
- * Two things this buys over calling the Claude API from the browser:
- *   1. No API key. It authenticates exactly the way `claude` does, off your
- *      existing login, and bills to that same account.
- *   2. Every MCP server in your Claude Code config is available, including the
- *      local stdio ones a browser could never reach — higgsfield, elevenlabs,
- *      android, playwright, palmier-pro and the rest.
- *
- *   node bridge/server.mjs
- */
+/** JARVIS authenticated local bridge.
+ * Owns turns and backend-only provider requests. Claude Agent retains its SDK
+ * authentication/MCP configuration; API modes use separate Windows-protected
+ * keys and validated display/UI/camera function handlers. Vendor runtime/service
+ * terms remain independent of the project MIT license. See README.md. */
 
 import { WebSocketServer } from 'ws'
 import { once } from 'node:events'
@@ -241,7 +230,7 @@ const READ_ONLY_MCP = new Set([
   'openrouter', 'openrouter-image', 'Microsoft_Clarity',
   // The generation servers belong here too, and leaving them out was a real
   // regression: `generate_image` begins with no read verb, so it fell to the
-  // deny branch and "generate an image of the Mark VII suit" — the headline
+  // deny branch and "generate a futuristic system diagram" — the headline
   // demo — stopped working in the default mode.
   //
   // Putting them on the allowlist is safe because the veto below still applies

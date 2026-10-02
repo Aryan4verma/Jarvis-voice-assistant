@@ -1,17 +1,8 @@
-/**
- * Sound design.
- *
- * Every cue is synthesised in Web Audio rather than shipped as a file, so the
- * app makes the right noises the moment you clone it — nothing to download, no
- * licence to worry about, a few hundred bytes instead of a few megabytes.
- *
- * To use real recordings instead, drop matching files into `public/audio/`
- * (boot.mp3, wake.mp3, listen.mp3, tool.mp3, done.mp3, error.mp3) and they take
- * over automatically. Pixabay's sci-fi UI and HUD packs are the usual source —
- * CC0, no attribution, safe on a monetised channel. `ambient.mp3` is not one of
- * these: the looping bed is music.ts's, and the oscillator pair at the bottom of
- * this file is only the fallback for when that file isn't there.
- */
+/** Project Web Audio sound design, covered by the project MIT attribution.
+ * Startup/interface cues are synthesized; no recordings are bundled.
+ * Private, Git-ignored public/audio overrides still work with the existing loader.
+ * Verify their separate rights before distributing a build that includes them.
+ * The optional continuous synthesized bed is not enabled by normal startup. */
 
 type Cue = 'boot' | 'wake' | 'listen' | 'tool' | 'done' | 'error'
 
@@ -228,8 +219,7 @@ const BED = 0.05
  * lowpass — barely audible on its own, but its absence is obvious. Keeps the
  * interface feeling powered rather than paused.
  *
- * Only a fallback: when public/audio/ambient.mp3 is present music.ts owns this
- * layer, which is why nothing calls this today.
+ * An optional bed; normal startup does not call this.
  */
 export function startAmbient() {
   if (ambient || !ctx || ctx.state !== 'running') return

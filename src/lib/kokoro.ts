@@ -14,8 +14,9 @@ let queuedGenerations = 0
  * carries four British male voices, which is what this project actually wants.
  *
  * The cost is a one-time ~86MB model download, cached by the browser
- * afterwards. It's fetched during the boot sequence so the first "Hey Jarvis"
- * isn't waiting on it, and anything that goes wrong falls back to Daniel.
+ * afterwards. It is loaded only when the optional Kokoro engine is selected. Failures
+ * fall back to the available system voice. Model and embedded eSpeak NG
+ * redistribution terms require separate review; see THIRD_PARTY_NOTICES.md.
  */
 
 import { KOKORO_VOICE } from '../config'
